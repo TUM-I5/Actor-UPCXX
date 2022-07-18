@@ -1,0 +1,11 @@
+target_sources(
+    pond
+    PRIVATE
+    Configuration.cpp
+    Configuration.hpp
+    Logger.cpp
+    Logger.hh
+    ProgressBar.hh
+    args.hh
+    help.hh
+)

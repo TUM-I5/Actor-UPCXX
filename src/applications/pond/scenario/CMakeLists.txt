@@ -1,0 +1,14 @@
+target_sources(
+    pond
+    PRIVATE
+    NetCdfData.cpp
+    NetCdfData.hpp
+    NetCdfScenario.cpp
+    NetCdfScenario.hpp
+    SWE_Scenario.hh
+    SWE_simple_scenarios.hh
+    ScalablePoolDropScenario.cpp
+    ScalablePoolDropScenario.hpp
+    SimulationArea.cpp
+    SimulationArea.hpp
+)

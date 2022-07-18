@@ -1,0 +1,10 @@
+target_sources(
+    pond
+    PRIVATE
+    BlockCommunicator.cpp
+    BlockCommunicator.hpp
+    SWE_Block.cpp
+    SWE_Block.hh
+    SWE_WaveAccumulationBlock.cpp
+    SWE_WaveAccumulationBlock.hh
+)

@@ -1,0 +1,18 @@
+target_sources(
+    pond
+    PRIVATE
+    AugRie.hpp
+    AugRieCUDA.h
+    AugRieFun.hpp
+    AugRieGeoClaw.hpp
+    AugRie_SIMD.hpp
+    FWave.hpp
+    FWaveCuda.h
+    FWaveVec.hpp
+    HLLEFun.hpp
+    Hybrid.hpp
+    SIMD_COSTS.hpp
+    SIMD_DEFINITIONS.hpp
+    SIMD_TYPES.hpp
+    WavePropagation.hpp
+)

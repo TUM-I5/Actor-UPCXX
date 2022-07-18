@@ -1,0 +1,14 @@
+target_sources(
+    pond
+    PRIVATE
+    ActorDistributor.cpp
+    ActorDistributor.hpp
+    ActorOrchestrator.cpp
+    ActorOrchestrator.hpp
+    FiedlerVectorActorDistributor.cpp
+    FiedlerVectorActorDistributor.hpp
+    MetisActorDistributor.cpp
+    MetisActorDistributor.hpp
+    SimpleActorDistributor.cpp
+    SimpleActorDistributor.hpp
+)
