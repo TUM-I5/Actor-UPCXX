@@ -130,7 +130,7 @@ void DoubleHeightSimulationActor::reInitializeBlock()
     size_t yPos = position[1];
     auto totalX = configuration->xSize / (configuration->patchSize * 2);
     auto totalY = configuration->ySize / configuration->patchSize;
-    block->reinitScenario(patchArea.minX, patchArea.minY, *(configuration->scenario), true);
+    block->reinitScenario(*(configuration->scenario), true);
     initializeBoundary(BoundaryEdge::BND_LEFT, [xPos]() { return xPos == 0; });
     initializeBoundary(BoundaryEdge::BND_RIGHT, [xPos, totalX]() { return xPos == totalX - 1; });
     initializeBoundary(BoundaryEdge::BND_BOTTOM, [yPos]() { return yPos == 0; });

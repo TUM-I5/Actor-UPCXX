@@ -53,8 +53,8 @@ class TaskDeque
     double timeForcedTermination = 0.0;
     size_t tries = 0;
     size_t stole = 0;
-    size_t tried_to_steal_remotely_rejected = 0;
-    size_t tried_to_steal_locally_rejected = 0;
+    // size_t tried_to_steal_remotely_rejected = 0;
+    // size_t tried_to_steal_locally_rejected = 0;
     size_t termtrial = 0;
     size_t execs = 0;
     std::chrono::_V2::steady_clock::time_point computationBegin;
@@ -81,8 +81,8 @@ class TaskDeque
     bool computing_temrination_result = false;
     bool termination_result = false;
     bool steal_cooldown = false;
-    bool checkpoint_output = false;
-    bool checkpoint_barrier = false;
+    bool sample_output = false;
+    bool sample_barrier = false;
     double timeout = -1.0;
 
     bool rma_taskcount = false;
@@ -95,6 +95,18 @@ class TaskDeque
     double slowdown_from = -1.0;
     double slowdown_to = -1.0;
 
+    double cp_interval = 180.0;
+    unsigned int timestep_synchronization_at = 0;
+    size_t actors_in_sync_point = 0;
+    bool sync_started = false;
+    uint64_t sync_point_difference = 0;
+    uint64_t next_sync_point = 0;
+    uint64_t sync_number = 1;
+    bool do_sync = false;
+
+    bool termination_started = false;
+    bool print_additional_statistics = false;
+
 #ifdef USE_ACTOR_TRIGGERS
     // actor triggers
     std::list<std::pair<std::string, std::unique_ptr<ActorTriggers>>> actorTriggers;
@@ -105,6 +117,7 @@ class TaskDeque
 
     bool print_gitter = false;
     bool steal_during_termination = false;
+    bool early_sample = false;
 
     std::chrono::_V2::steady_clock::time_point lastStealTime;
     std::chrono::_V2::steady_clock::time_point lastStealTryTime;
@@ -132,7 +145,7 @@ class TaskDeque
 
   private:
     upcxx::future<> steal(const std::string nameOfActorToSteal);
-    bool checkTermination();
+    void checkTermination();
     bool checkTimeout(std::chrono::_V2::steady_clock::time_point &begin, double timeout);
     void executeActor(const std::string &name);
     upcxx::future<std::string> findVictim();
@@ -146,4 +159,7 @@ class TaskDeque
     upcxx::future<GlobalActorRef> offload(const std::string nameOfActorToOffload, const upcxx::intrank_t to);
     bool abort();
     void check_abort(std::chrono::_V2::steady_clock::time_point &begin);
+    void enter_sync_point();
+    void wait_for_sync_point();
+    void notify_termination();
 };

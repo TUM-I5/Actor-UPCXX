@@ -1,7 +1,5 @@
 #include "actor/SimulationActor.hpp"
 
-SimulationActor::SimulationActor() : SimulationActorBase() {}
-
 SimulationActor::SimulationActor(std::string &&name, size_t xPos, size_t yPos)
     : SimulationActorBase(std::move(name), {xPos, yPos})
 {
@@ -56,10 +54,11 @@ SimulationActor::SimulationActor(SimulationActor &&sa)
     : SimulationActorBase(std::move(dynamic_cast<SimulationActorBase &&>(sa)))
 {
 
+    reInitializeBlock();
     for (int i = 0; i < 4; i++)
     {
-        dataIn[i] = std::move(sa.dataIn[i]);
-        dataOut[i] = std::move(sa.dataOut[i]);
+        dataIn[i] = sa.dataIn[i];
+        dataOut[i] = sa.dataOut[i];
         sa.dataIn[i] = nullptr;
         sa.dataOut[i] = nullptr;
     }
@@ -67,28 +66,6 @@ SimulationActor::SimulationActor(SimulationActor &&sa)
     {
         throw std::runtime_error("Unallowed input params");
     }
-}
-
-SimulationActor &SimulationActor::operator=(SimulationActor &&sa)
-{
-    // makePorts();
-    // reInitializeBlock();
-
-    for (int i = 0; i < 4; i++)
-    {
-        dataIn[i] = std::move(sa.dataIn[i]);
-        dataOut[i] = std::move(sa.dataOut[i]);
-        sa.dataIn[i] = nullptr;
-        sa.dataOut[i] = nullptr;
-    }
-
-    SimulationActorBase::operator=(dynamic_cast<SimulationActorBase &&>(std::move(sa)));
-
-    if (nextWriteTime == 0.0 || outputDelta == 0.0)
-    {
-        throw std::runtime_error("Unallowed input params");
-    }
-    return *this;
 }
 
 SimulationActor::SimulationActor(SimulationActorBaseData &&sabd) : SimulationActorBase(std::move(sabd))
@@ -150,7 +127,7 @@ void SimulationActor::reInitializeBlock()
     size_t yPos = position[1];
     auto totalX = configuration->xSize / configuration->patchSize;
     auto totalY = configuration->ySize / configuration->patchSize;
-    block->reinitScenario(patchArea.minX, patchArea.minY, *(configuration->scenario), true);
+    block->reinitScenario(*(configuration->scenario), true);
     initializeBoundary(BoundaryEdge::BND_LEFT, [xPos]() { return xPos == 0; });
     initializeBoundary(BoundaryEdge::BND_RIGHT, [xPos, totalX]() { return xPos == totalX - 1; });
     initializeBoundary(BoundaryEdge::BND_BOTTOM, [yPos]() { return yPos == 0; });

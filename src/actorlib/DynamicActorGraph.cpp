@@ -464,7 +464,7 @@ void DynamicActorGraph::initConnectionsSync(
 
 double DynamicActorGraph::run()
 {
-    double interval = std::numeric_limits<float>::max();
+    double interval = std::numeric_limits<double>::max();
     size_t iter = 0;
     double timeInMigrationPhase = 0.0;
     auto computationBegin = util::timepoint();
@@ -476,8 +476,8 @@ double DynamicActorGraph::run()
             const char *env_p = std::getenv("REPARTITIONING_INTERVAL");
             if (env_p != nullptr)
             {
-                float num_float = std::stof(env_p);
-                interval = num_float;
+                double num_double = std::stof(env_p);
+                interval = num_double;
             }
             else
             {
@@ -788,7 +788,7 @@ upcxx::future<> DynamicActorGraph::reconnectToNeighboursAsync(const std::string 
         //         << std::endl;
     }
 
-    upcxx::future<> all = util::combineFutures(futs);
+    upcxx::future<> all = util::combineFutures(std::move(futs));
     return all;
 }
 
@@ -908,13 +908,18 @@ void DynamicActorGraph::disconnectActors(const std::unordered_map<std::string, u
     }
 }
 
-bool DynamicActorGraph::tryToAcquireLockForActor(const std::string name, const upcxx::intrank_t marker,
-                                                 float workofother)
+bool DynamicActorGraph::tryToAcquireLockForActor(const std::string name, const upcxx::intrank_t marker, double workload)
 {
-    float work = (time_spent_for_cost) ? static_cast<float>(this->ag.getWorkDoneForMigration())
-                                       : static_cast<float>(this->ag.getTaskCount());
+    if (use_rma)
+    {
+        double my_workload = (time_spent_for_cost) ? *this->ag.gatheredCost->local() : *this->ag.taskCount->local();
+        if (my_workload < allowed_imbalance * workload)
+        {
+            return false;
+        }
+    }
 
-    if (work < allowed_imbalance * workofother)
+    if (this->stealing_from_me.find(marker) != stealing_from_me.end())
     {
         return false;
     }
@@ -943,7 +948,8 @@ bool DynamicActorGraph::tryToAcquireLockForActor(const std::string name, const u
 
     ActorImpl *ai = *ref.local();
 
-    if (ai->getRunningState() == ActorState::Terminated || ai->isMarked() || ai->isPinned() || !ai->actable())
+    if (ai->getRunningState() == ActorState::Terminated || ai->isMarked() || ai->isPinned() || !ai->actable() ||
+        !ai->acted)
     {
         return false;
     }
@@ -988,7 +994,20 @@ upcxx::future<bool> DynamicActorGraph::tryToMarkActorForMigration(const std::str
         return upcxx::make_future(false);
     }
 
+    if (use_rma && !time_spent_for_cost)
+    {
+        if (*this->ag.taskCount->local() <= 1)
+        {
+            return upcxx::make_future(false);
+        }
+    }
+
     int at = ref.where();
+
+    if (stealing_from_me.find(at) != stealing_from_me.end())
+    {
+        return upcxx::make_future(false);
+    }
 
     if (at == upcxx::rank_me())
     {
@@ -996,14 +1015,13 @@ upcxx::future<bool> DynamicActorGraph::tryToMarkActorForMigration(const std::str
         // throw std::runtime_error("Don't steal an actor that is already on your rank!");
     }
 
-    float work = (time_spent_for_cost) ? static_cast<float>(this->ag.getWorkDoneForMigration())
-                                       : static_cast<float>(this->ag.getTaskCount());
+    double workload = (time_spent_for_cost) ? *this->ag.gatheredCost->local() : *this->ag.taskCount->local();
 
     upcxx::future<bool> locked = upcxx::rpc(
         at,
-        [](upcxx::dist_object<DynamicActorGraph *> &rdag, std::string name, upcxx::intrank_t marker, float work)
-        { return (*rdag)->tryToAcquireLockForActor(name, marker, work); },
-        remoteComponents, std::move(name), upcxx::rank_me(), work);
+        [](upcxx::dist_object<DynamicActorGraph *> &rdag, std::string name, upcxx::intrank_t marker, double workload)
+        { return (*rdag)->tryToAcquireLockForActor(name, marker, workload); },
+        remoteComponents, std::move(name), upcxx::rank_me(), workload);
 
     return locked;
 }
@@ -1210,7 +1228,7 @@ upcxx::future<> DynamicActorGraph::severeConnections(const std::unordered_map<st
         futs.emplace_back(std::move(f));
     }
 
-    upcxx::future<> combined = util::combineFutures(futs);
+    upcxx::future<> combined = util::combineFutures(std::move(futs));
     return combined;
 }
 
@@ -1238,7 +1256,7 @@ DynamicActorGraph::resurrectConnections(const std::unordered_map<std::string, up
         futs.emplace_back(std::move(f));
     }
 
-    upcxx::future<> combined = util::combineFutures(futs);
+    upcxx::future<> combined = util::combineFutures(std::move(futs));
     return combined;
 }
 
@@ -1396,14 +1414,15 @@ upcxx::future<> DynamicActorGraph::resurrectConnections(const std::string &name,
     }
 
     upcxx::future<> fut = allDone.finalize();
-    upcxx::future<> tmp = util::combineFutures(futs);
-    upcxx::future<> resurrected = upcxx::when_all(fut, tmp);
+    upcxx::future<> tmp = util::combineFutures(std::move(futs));
+    upcxx::future<> resurrected = upcxx::when_all(std::move(fut), std::move(tmp));
 
     return resurrected;
 }
 
 upcxx::future<GlobalActorRef> DynamicActorGraph::stealActorAsync(const std::string name)
 {
+
     if (name.empty())
     {
         throw std::runtime_error("cant steal actor with empty name");
@@ -1419,6 +1438,7 @@ upcxx::future<GlobalActorRef> DynamicActorGraph::stealActorAsync(const std::stri
 #ifdef REPORT_MAIN_ACTIONS
     std::cout << "Stealing begins " << name << " from rank: " << from << " to: " << upcxx::rank_me() << std::endl;
 #endif
+    this->ag.register_migration(ref.where());
 
     if (ref.where() != upcxx::rank_me())
     {
@@ -1449,9 +1469,7 @@ upcxx::future<GlobalActorRef> DynamicActorGraph::stealActorAsync(const std::stri
         upcxx::future<> rmed =
             prepared.then([name, this]() -> upcxx::future<> { return std::get<0>(this->ag.rmActorAsync(name)); });
 
-        upcxx::future<> rmed_from_map = rmed;
-        /*
-        rmed.then(
+        upcxx::future<> rmed_from_map = rmed.then(
             [neighbors]()
             {
                 upcxx::promise<> allDone;
@@ -1467,9 +1485,9 @@ upcxx::future<GlobalActorRef> DynamicActorGraph::stealActorAsync(const std::stri
                 upcxx::discharge();
                 upcxx::future<> discharged = allDone.finalize();
                 upcxx::future<> self_progged = discharged.then([]() { upcxx::progress(); });
+                // upcxx::future<> self_progged = discharged;
                 return self_progged;
             });
-            */
 
 #ifdef USE_ACTOR_TRIGGERS
         upcxx::future<ActorTriggers> got_triggers = rmed_from_map.then(
@@ -1500,7 +1518,61 @@ upcxx::future<GlobalActorRef> DynamicActorGraph::stealActorAsync(const std::stri
         upcxx::future<> changed_rank =
             rdy_to_reinsert.then([this, name](GlobalActorRef _r) { this->pg.changeRankAsyncFF(name); });
 
-        upcxx::future<GlobalActorRef> reinserted = rdy_to_reinsert.then(
+        // upcxx::future<GlobalActorRef> old2 = upcxx::when_all(reinserted, old);
+
+        // delete old actor
+        upcxx::future<> deleted = rdy_to_reinsert.then( // old2.then(
+            [ref, this](GlobalActorRef sent)
+            {
+                if (ref == sent)
+                {
+                    throw std::runtime_error("Old ref should not be the same as the new ref after stealing!");
+                }
+
+                GlobalActorRef old = ref;
+                upcxx::future<> deld = upcxx::rpc(
+                    old.where(),
+                    [](GlobalActorRef old, upcxx::dist_object<DynamicActorGraph *> &remoteComponents)
+                    {
+                        ActorImpl *aimpl = *old.local();
+
+                        if (!aimpl->hasNoMessages())
+                        {
+                            throw std::runtime_error("During deletion of old actor inports must be empty!");
+                        }
+
+                        if (!aimpl->buffersEmpty())
+                        {
+                            aimpl->flushBuffers();
+                            if (!aimpl->buffersEmpty())
+                            {
+                                throw std::runtime_error("During deletion of old actor buffers must be empty!");
+                            }
+                        }
+
+                        delete aimpl;
+                        (*remoteComponents)->deallocated_actors += 1;
+
+                        upcxx::delete_(old);
+                    },
+                    old, this->remoteComponents);
+                return deld;
+            });
+
+        upcxx::future<GlobalActorRef> rrr = upcxx::when_all(rdy_to_reinsert, deleted);
+
+        // refill ports of the actor
+        upcxx::future<GlobalActorRef> refilled = rrr.then(
+            [name, this](GlobalActorRef sameref) -> GlobalActorRef
+            {
+                ActorImpl *a = *sameref.local();
+                a->refillPorts();
+                a->broadcastTaskDeque(this->ag.getTaskDeque());
+
+                return sameref;
+            });
+
+        upcxx::future<GlobalActorRef> reinserted = refilled.then(
             [name, this](GlobalActorRef ref) -> upcxx::future<GlobalActorRef>
             {
                 if (ref.where() != upcxx::rank_me())
@@ -1509,83 +1581,12 @@ upcxx::future<GlobalActorRef> DynamicActorGraph::stealActorAsync(const std::stri
                 }
                 upcxx::future<> added = this->ag.addActorToAnotherAsync(ref, upcxx::rank_me());
                 upcxx::future<GlobalActorRef> r = upcxx::make_future(ref);
-                upcxx::future<GlobalActorRef> rr = upcxx::when_all(r, added);
+                upcxx::future<GlobalActorRef> rr = upcxx::when_all(std::move(r), std::move(added));
                 return rr;
                 // return this->ag.changeRef(name, ref);
             });
 
-        // upcxx::future<GlobalActorRef> old2 = upcxx::when_all(reinserted, old);
-
-        // delete old actor
-        upcxx::future<std::vector<std::pair<std::string, std::vector<std::vector<float>>>>> deleted =
-            reinserted.then( // old2.then(
-                [ref, this](GlobalActorRef sent)
-                {
-                    if (ref == sent)
-                    {
-                        throw std::runtime_error("Old ref should not be the same as the new ref after stealing!");
-                    }
-
-                    GlobalActorRef old = ref;
-                    upcxx::future<std::vector<std::pair<std::string, std::vector<std::vector<float>>>>> deld =
-                        upcxx::rpc(
-                            old.where(),
-                            [](GlobalActorRef old, upcxx::dist_object<DynamicActorGraph *> &remoteComponents)
-                            {
-                                std::vector<std::pair<std::string, std::vector<std::vector<float>>>> v;
-                                ActorImpl *aimpl = *old.local();
-
-                                if (!aimpl->hasNoMessages())
-                                {
-                                    v = aimpl->extract_messages<std::vector<float>, 64>();
-                                    std::cerr << upcxx::rank_me() << " had to extract messages" << std::endl;
-
-                                    // throw std::runtime_error("During deletion of old actor inports must be empty!");
-                                }
-
-                                if (!aimpl->buffersEmpty())
-                                {
-                                    aimpl->flushBuffers();
-                                    if (!aimpl->buffersEmpty())
-                                    {
-                                        throw std::runtime_error("During deletion of old actor buffers must be empty!");
-                                    }
-                                }
-
-                                delete aimpl;
-                                (*remoteComponents)->deallocated_actors += 1;
-
-                                upcxx::delete_(old);
-
-                                return v;
-                            },
-                            old, this->remoteComponents);
-                    return deld;
-                });
-
-        upcxx::future<GlobalActorRef, std::vector<std::pair<std::string, std::vector<std::vector<float>>>>> rrr =
-            upcxx::when_all(reinserted, deleted);
-
-        // refill ports of the actor
-        upcxx::future<GlobalActorRef> refilled = rrr.then(
-            [name, this](GlobalActorRef sameref,
-                         std::vector<std::pair<std::string, std::vector<std::vector<float>>>> msgs) -> GlobalActorRef
-            {
-                ActorImpl *a = *sameref.local();
-                a->refillPorts();
-                a->broadcastTaskDeque(this->ag.getTaskDeque());
-
-                for (auto &&pr : msgs)
-                {
-                    auto *ainp = a->getInPort(pr.first);
-                    InPort<std::vector<float>, 64> *inp = dynamic_cast<InPort<std::vector<float>, 64> *>(ainp);
-                    inp->reinsert_messages(std::move(pr.second));
-                }
-
-                return sameref;
-            });
-
-        upcxx::future<GlobalActorRef> reconn = refilled.then(
+        upcxx::future<GlobalActorRef> reconn = reinserted.then(
             [name, this](GlobalActorRef a)
             {
                 upcxx::future<> res = this->resurrectConnections(name, a);
@@ -1953,7 +1954,7 @@ upcxx::future<GlobalActorRef> DynamicActorGraph::offloadActorAsync(const std::st
     }
 }
 
-upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks(const std::set<int> &ranks)
+upcxx::future<std::vector<double>> DynamicActorGraph::getWorkOfOtherRanks(const std::set<int> &ranks)
 {
     if (dont_use_buffer)
     {
@@ -1964,8 +1965,8 @@ upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks(const s
     buffer.resize(upcxx::rank_n());
     std::fill(buffer.begin(), buffer.end(), 0.0);
 
-    // buffer[upcxx::rank_me()] = (time_spent_for_cost) ? static_cast<float>(this->ag.getWorkDoneForMigration())
-    //                                                  : static_cast<float>(this->ag.getTaskCount());
+    // buffer[upcxx::rank_me()] = (time_spent_for_cost) ? static_cast<double>(this->ag.getWorkDoneForMigration())
+    //                                                  : static_cast<double>(this->ag.getTaskCount());
 
     std::vector<upcxx::future<>> f;
     f.reserve(ranks.size());
@@ -1982,31 +1983,60 @@ upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks(const s
             if (!use_rma)
             {
 
-                upcxx::future<float> df = upcxx::rpc(
+                upcxx::future<double> df = upcxx::rpc(
                     r,
                     [](upcxx::dist_object<DynamicActorGraph *> &remoteComponents)
                     {
-                        float t = ((*remoteComponents)->time_spent_for_cost)
-                                      ? static_cast<float>((*remoteComponents)->ag.getWorkDoneForMigration())
-                                      : static_cast<float>((*remoteComponents)->ag.getTaskCount());
+                        double c = (*remoteComponents)->ag.getRandomActorCost();
+                        unsigned int tc = 1;
+                        if constexpr (config::migrationtype == config::MigrationType::ASYNC)
+                        {
+                            c = -c;
+                            tc = -1;
+                        }
+
+                        double t = ((*remoteComponents)->time_spent_for_cost)
+                                       ? static_cast<double>((*remoteComponents)->ag.getWorkDoneForMigration() + c)
+                                       : static_cast<double>(
+                                             std::max<unsigned int>((*remoteComponents)->ag.getTaskCount(), 1) + tc);
                         return t;
                     },
                     remoteComponents);
 
-                upcxx::future<> dif = df.then([r, this](float d) { this->buffer[r] = d; });
-                f.push_back(dif);
+                upcxx::future<> dif = df.then([r, this](double d) { this->buffer[r] = d; });
+                f.push_back(std::move(dif));
             }
             else
             {
-                upcxx::future<unsigned int> wk = upcxx::rget(this->ag.gptrsToTaskCounts[r]);
-                upcxx::future<> dif = wk.then([r, this](unsigned int d) { this->buffer[r] = static_cast<float>(d); });
-                f.push_back(dif);
+                if (timetask)
+                {
+                    upcxx::future<double> wk = upcxx::rget(this->ag.gptrsToApproxTaskCosts[r]);
+                    upcxx::future<> dif = wk.then([r, this](double d) { this->buffer[r] = static_cast<double>(d); });
+                    f.push_back(std::move(dif));
+                }
+                else
+                {
+                    if (!time_spent_for_cost)
+                    {
+                        upcxx::future<unsigned int> wk = upcxx::rget(this->ag.gptrsToTaskCounts[r]);
+                        upcxx::future<> dif =
+                            wk.then([r, this](unsigned int d) { this->buffer[r] = static_cast<double>(d); });
+                        f.push_back(std::move(dif));
+                    }
+                    else
+                    {
+                        upcxx::future<double> wk = upcxx::rget(this->ag.gptrsToGatheredCosts[r]);
+                        upcxx::future<> dif =
+                            wk.then([r, this](double d) { this->buffer[r] = static_cast<double>(d); });
+                        f.push_back(std::move(dif));
+                    }
+                }
             }
         }
     }
-    upcxx::future<> all = util::combineFutures(f);
+    upcxx::future<> all = util::combineFutures(std::move(f));
 
-    upcxx::future<std::vector<float>> done = all.then(
+    upcxx::future<std::vector<double>> done = all.then(
         [this]()
         {
             if (!dont_use_buffer)
@@ -2014,19 +2044,19 @@ upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks(const s
                 throw std::runtime_error("getWork called for a second time before the first one was completed!");
             }
 
-            std::vector<float> trt = std::move(this->buffer);
+            std::vector<double> trt = std::move(this->buffer);
             buffer.clear();
             dont_use_buffer = false;
             // Communication takes some time so we take (comm beg + comm end) / 2 as a guess
 
             if (!use_rma)
             {
-                trt[upcxx::rank_me()] = (time_spent_for_cost) ? static_cast<float>(this->ag.getWorkDoneForMigration())
-                                                              : static_cast<float>(this->ag.getTaskCount());
+                trt[upcxx::rank_me()] = (time_spent_for_cost) ? static_cast<double>(this->ag.getWorkDoneForMigration())
+                                                              : static_cast<double>(this->ag.getTaskCount());
             }
             else
             {
-                trt[upcxx::rank_me()] = static_cast<float>(*this->ag.taskCount->local());
+                trt[upcxx::rank_me()] = getWork();
             }
 
             // trt[upcxx::rank_me()] /= 2.0;
@@ -2036,7 +2066,7 @@ upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks(const s
     return done;
 }
 
-upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks()
+upcxx::future<std::vector<double>> DynamicActorGraph::getWorkOfOtherRanks()
 {
     std::vector<upcxx::future<>> f;
     f.reserve(upcxx::rank_n());
@@ -2054,57 +2084,85 @@ upcxx::future<std::vector<float>> DynamicActorGraph::getWorkOfOtherRanks()
     {
         if (r == upcxx::rank_me())
         {
-            // buffer[r] = (time_spent_for_cost) ? static_cast<float>(this->ag.getWorkDoneForMigration())
-            //                                   : static_cast<float>(this->ag.getTaskCount());
+            // buffer[r] = (time_spent_for_cost) ? static_cast<double>(this->ag.getWorkDoneForMigration())
+            //                                   : static_cast<double>(this->ag.getTaskCount());
             continue;
         }
 
         if (!use_rma)
         {
 
-            upcxx::future<float> df = upcxx::rpc(
+            upcxx::future<double> df = upcxx::rpc(
                 r,
                 [](upcxx::dist_object<DynamicActorGraph *> &remoteComponents)
                 {
-                    float t = ((*remoteComponents)->time_spent_for_cost)
-                                  ? static_cast<float>((*remoteComponents)->ag.getWorkDoneForMigration())
-                                  : static_cast<float>((*remoteComponents)->ag.getTaskCount());
+                    double c = (*remoteComponents)->ag.getRandomActorCost();
+                    unsigned int tc = 1;
+                    if constexpr (config::migrationtype == config::MigrationType::ASYNC)
+                    {
+                        c = -c;
+                        tc = -1;
+                    }
+
+                    double t = ((*remoteComponents)->time_spent_for_cost)
+                                   ? static_cast<double>((*remoteComponents)->ag.getWorkDoneForMigration() + c)
+                                   : static_cast<double>(
+                                         std::max<unsigned int>((*remoteComponents)->ag.getTaskCount(), 1) + tc);
                     return t;
                 },
                 remoteComponents);
 
-            upcxx::future<> dif = df.then([r, this](float d) { this->buffer[r] = d; });
-            f.push_back(dif);
+            upcxx::future<> dif = df.then([r, this](double d) { this->buffer[r] = d; });
+            f.push_back(std::move(dif));
         }
         else
         {
-            upcxx::future<unsigned int> wk = upcxx::rget(this->ag.gptrsToTaskCounts[r]);
-            upcxx::future<> dif = wk.then([r, this](unsigned int d) { this->buffer[r] = static_cast<float>(d); });
-            f.push_back(dif);
+            if (timetask)
+            {
+                upcxx::future<double> wk = upcxx::rget(this->ag.gptrsToApproxTaskCosts[r]);
+                upcxx::future<> dif = wk.then([r, this](double d) { this->buffer[r] = static_cast<double>(d); });
+                f.push_back(std::move(dif));
+            }
+            else
+            {
+                if (!time_spent_for_cost)
+                {
+                    upcxx::future<unsigned int> wk = upcxx::rget(this->ag.gptrsToTaskCounts[r]);
+                    upcxx::future<> dif =
+                        wk.then([r, this](unsigned int d) { this->buffer[r] = static_cast<double>(d); });
+                    f.push_back(std::move(dif));
+                }
+                else
+                {
+                    upcxx::future<double> wk = upcxx::rget(this->ag.gptrsToGatheredCosts[r]);
+                    upcxx::future<> dif = wk.then([r, this](double d) { this->buffer[r] = static_cast<double>(d); });
+                    f.push_back(std::move(dif));
+                }
+            }
         }
     }
-    upcxx::future<> all = util::combineFutures((f));
+    upcxx::future<> all = util::combineFutures(std::move(f));
 
-    upcxx::future<std::vector<float>> done = all.then(
-        [this]() -> std::vector<float>
+    upcxx::future<std::vector<double>> done = all.then(
+        [this]() -> std::vector<double>
         {
             if (!dont_use_buffer)
             {
                 throw std::runtime_error("getWork called for a second time before the first one was completed!");
             }
 
-            std::vector<float> trt = std::move(buffer);
+            std::vector<double> trt = std::move(buffer);
             buffer.clear();
             dont_use_buffer = false;
             // Communication takes some time so we take (comm beg + comm end) / 2 as a guess
             if (!use_rma)
             {
-                trt[upcxx::rank_me()] = (time_spent_for_cost) ? static_cast<float>(this->ag.getWorkDoneForMigration())
-                                                              : static_cast<float>(this->ag.getTaskCount());
+                trt[upcxx::rank_me()] = (time_spent_for_cost) ? static_cast<double>(this->ag.getWorkDoneForMigration())
+                                                              : static_cast<double>(this->ag.getTaskCount());
             }
             else
             {
-                trt[upcxx::rank_me()] = static_cast<float>(*this->ag.taskCount->local());
+                trt[upcxx::rank_me()] = getWork();
             }
             // trt[upcxx::rank_me()] /= 2.0;
 
@@ -2133,13 +2191,13 @@ upcxx::future<std::vector<std::string>> DynamicActorGraph::findActorsToSteal()
 
 #ifdef GLOBAL_MIGRATION
 #ifdef STEAL_FROM_BUSY_RANK
-    upcxx::future<std::vector<float>> work = getWorkOfOtherRanks();
+    upcxx::future<std::vector<double>> work = getWorkOfOtherRanks();
 
     upcxx::future<std::vector<std::string>> fnd = work.then(
-        [this](std::vector<float> ds) -> std::vector<std::string>
+        [this](std::vector<double> ds) -> std::vector<std::string>
         {
             int maxElementIndex = std::max_element(std::begin(ds), std::end(ds)) - std::begin(ds);
-            float maxElement = ds[maxElementIndex];
+            double maxElement = ds[maxElementIndex];
             if (maxElementIndex != upcxx::rank_me() && maxElement > allowed_imbalance * ds[upcxx::rank_me()])
             {
                 if (stealing_from_me.find(maxElementIndex) == stealing_from_me.end())
@@ -2157,12 +2215,11 @@ upcxx::future<std::vector<std::string>> DynamicActorGraph::findActorsToSteal()
 #else
     auto v = this->pg.getRandomActors(config::actor_steal_list_size, upcxx::rank_me());
     return upcxx::make_future(std::move(v));
-
 #endif
 #else
 #ifdef STEAL_FROM_BUSY_RANK
     std::set<int> bordering_ranks = this->pg.borderingRanks(upcxx::rank_me());
-    upcxx::future<std::vector<float>> work;
+    upcxx::future<std::vector<double>> work;
     if (bordering_ranks.empty())
     {
         // rank is empty so we steal from anz rank
@@ -2174,10 +2231,10 @@ upcxx::future<std::vector<std::string>> DynamicActorGraph::findActorsToSteal()
     }
 
     upcxx::future<std::vector<std::string>> fnd = work.then(
-        [this](std::vector<float> ds) -> std::vector<std::string>
+        [this](std::vector<double> ds) -> std::vector<std::string>
         {
             int maxElementIndex = std::max_element(std::begin(ds), std::end(ds)) - std::begin(ds);
-            float maxElement = ds[maxElementIndex];
+            double maxElement = ds[maxElementIndex];
             if (maxElementIndex != upcxx::rank_me() && maxElement > allowed_imbalance * ds[upcxx::rank_me()])
             {
                 if (stealing_from_me.find(maxElementIndex) == stealing_from_me.end())
@@ -2249,16 +2306,16 @@ upcxx::future<std::string> DynamicActorGraph::findAnActorToStealAndMark()
 
 #ifdef GLOBAL_MIGRATION
 #ifdef STEAL_FROM_BUSY_RANK
-    upcxx::future<std::vector<float>> work = getWorkOfOtherRanks();
+    upcxx::future<std::vector<double>> work = getWorkOfOtherRanks();
 
     upcxx::future<std::string> fnd = work.then(
-        [this](std::vector<float> ds) -> upcxx::future<std::string>
+        [this](std::vector<double> ds) -> upcxx::future<std::string>
         {
             std::string s;
             upcxx::future<std::string> vs = upcxx::make_future(s);
 
             int maxElementIndex = std::max_element(std::begin(ds), std::end(ds)) - std::begin(ds);
-            float maxElement = ds[maxElementIndex];
+            double maxElement = ds[maxElementIndex];
             if (maxElementIndex != upcxx::rank_me() && maxElement > allowed_imbalance * ds[upcxx::rank_me()])
             {
                 if (stealing_from_me.find(maxElementIndex) == stealing_from_me.end())
@@ -2284,17 +2341,17 @@ upcxx::future<std::string> DynamicActorGraph::findAnActorToStealAndMark()
         tries += 1;
         r = gen(rng);
     }
-    float t = (time_spent_for_cost) ? static_cast<float>(ag.getWorkDoneForMigration())
-                                    : static_cast<float>(ag.getTaskCount());
+    double t = (time_spent_for_cost) ? static_cast<double>(ag.getWorkDoneForMigration())
+                                     : static_cast<double>(ag.getTaskCount());
 
     if (r != upcxx::rank_me())
     {
         upcxx::future<std::string> vs = upcxx::rpc(
             r,
-            [](upcxx::dist_object<DynamicActorGraph *> &rmt, int marker, float work) -> std::string
+            [](upcxx::dist_object<DynamicActorGraph *> &rmt, int marker, double work) -> std::string
             {
-                float t = ((*rmt)->time_spent_for_cost) ? static_cast<float>((*rmt)->ag.getWorkDoneForMigration())
-                                                        : static_cast<float>((*rmt)->ag.getTaskCount());
+                double t = ((*rmt)->time_spent_for_cost) ? static_cast<double>((*rmt)->ag.getWorkDoneForMigration())
+                                                         : static_cast<double>((*rmt)->ag.getTaskCount());
                 if (t >= allowed_imbalance * work)
                 {
                     return (*rmt)->getMeAnActor(marker, upcxx::rank_me());
@@ -2310,7 +2367,7 @@ upcxx::future<std::string> DynamicActorGraph::findAnActorToStealAndMark()
 #else
 #ifdef STEAL_FROM_BUSY_RANK
     std::set<int> bordering_ranks = this->pg.borderingRanks(upcxx::rank_me());
-    upcxx::future<std::vector<float>> work;
+    upcxx::future<std::vector<double>> work;
     if (bordering_ranks.empty())
     {
         // rank is empty so we steal from anz rank
@@ -2322,7 +2379,7 @@ upcxx::future<std::string> DynamicActorGraph::findAnActorToStealAndMark()
     }
 
     upcxx::future<std::string> fnd = work.then(
-        [this](std::vector<float> ds) -> upcxx::future<std::string>
+        [this](std::vector<double> ds) -> upcxx::future<std::string>
         {
             std::string s;
             upcxx::future<std::string> victims = upcxx::make_future(s);
@@ -2333,7 +2390,7 @@ upcxx::future<std::string> DynamicActorGraph::findAnActorToStealAndMark()
                 throw std::runtime_error("HOW?");
             }
 
-            float maxElement = ds[maxElementIndex];
+            double maxElement = ds[maxElementIndex];
             if (maxElementIndex != upcxx::rank_me() && maxElement > allowed_imbalance * ds[upcxx::rank_me()])
             {
                 if (stealing_from_me.find(maxElementIndex) == stealing_from_me.end())
@@ -2377,14 +2434,14 @@ upcxx::future<std::string> DynamicActorGraph::findAnActorToStealAndMark()
 
         if (!r.empty() && r[0] != upcxx::rank_me())
         {
-            float t = (time_spent_for_cost) ? static_cast<float>(ag.getWorkDoneForMigration())
-                                            : static_cast<float>(ag.getTaskCount());
+            double t = (time_spent_for_cost) ? static_cast<double>(ag.getWorkDoneForMigration())
+                                             : static_cast<double>(ag.getTaskCount());
             return upcxx::rpc(
                 r[0],
-                [](upcxx::dist_object<DynamicActorGraph *> &rmt, int rank, float work) -> std::string
+                [](upcxx::dist_object<DynamicActorGraph *> &rmt, int rank, double work) -> std::string
                 {
-                    float t = ((*rmt)->time_spent_for_cost) ? static_cast<float>((*rmt)->ag.getWorkDoneForMigration())
-                                                            : static_cast<float>((*rmt)->ag.getTaskCount());
+                    double t = ((*rmt)->time_spent_for_cost) ? static_cast<double>((*rmt)->ag.getWorkDoneForMigration())
+                                                             : static_cast<double>((*rmt)->ag.getTaskCount());
                     if (t >= allowed_imbalance * work)
                     {
                         if ((*rmt)->contigious_migration)
@@ -2435,8 +2492,15 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
 {
 #ifndef GLOBAL_MIGRATION
 #ifndef ORDERED_OFFLOAD
-    std::set<int> bordering_ranks = this->pg.borderingRanks(upcxx::rank_me());
-    upcxx::future<std::vector<float>> work;
+    std::set<int> _bordering_ranks = this->pg.borderingRanks(upcxx::rank_me());
+    std::set<int> empty_ranks = this->pg.emptyRanks();
+    
+    std::set<int> bordering_ranks;
+    std::set_union(_bordering_ranks.begin(), _bordering_ranks.end(),
+                empty_ranks.begin(), empty_ranks.end(),
+                std::inserter(bordering_ranks, bordering_ranks.begin()));
+    
+    upcxx::future<std::vector<double>> work;
     if (bordering_ranks.empty())
     {
         // throw std::runtime_error("Offloading won't work with empty initial ranks!");
@@ -2450,11 +2514,11 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
     }
 
     upcxx::future<std::string, upcxx::intrank_t> fnd = work.then(
-        [this, bordering_ranks](std::vector<float> ds) -> upcxx::future<std::string, int>
+        [this, bordering_ranks](std::vector<double> ds) -> upcxx::future<std::string, int>
         {
             std::string victims;
 
-            std::vector<std::pair<upcxx::intrank_t, float>> filtered;
+            std::vector<std::pair<upcxx::intrank_t, double>> filtered;
             filtered.reserve(bordering_ranks.size() + 1);
 
             for (auto el : bordering_ranks)
@@ -2466,7 +2530,7 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
             auto maxelit = std::max_element(std::begin(filtered), std::end(filtered),
                                             [](const auto &l, const auto &r) { return l.second < r.second; });
             upcxx::intrank_t maxElementIndex = maxelit->first;
-            float max = maxelit->second;
+            double max = maxelit->second;
 
             auto minelit = std::min_element(std::begin(filtered), std::end(filtered),
                                             [](const auto &l, const auto &r) { return l.second < r.second; });
@@ -2507,7 +2571,7 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
     return fnd;
 #else
     std::set<int> bordering_ranks = this->pg.borderingRanks(upcxx::rank_me());
-    upcxx::future<std::vector<float>> work;
+    upcxx::future<std::vector<double>> work;
     if (bordering_ranks.empty())
     {
         // throw std::runtime_error("Offloading won't work with empty initial ranks!");
@@ -2521,11 +2585,11 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
     }
 
     upcxx::future<std::string, upcxx::intrank_t> fnd = work.then(
-        [this, bordering_ranks](std::vector<float> ds) -> upcxx::future<std::string, int>
+        [this, bordering_ranks](std::vector<double> ds) -> upcxx::future<std::string, int>
         {
             std::string victims;
 
-            std::vector<std::pair<upcxx::intrank_t, float>> zipped;
+            std::vector<std::pair<upcxx::intrank_t, double>> zipped;
             zipped.reserve(bordering_ranks.size() + 1);
 
             for (auto el : bordering_ranks)
@@ -2561,18 +2625,18 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
 #endif
 #else
 #ifndef ORDERED_OFFLOAD
-    upcxx::future<std::vector<float>> work = getWorkOfOtherRanks();
+    upcxx::future<std::vector<double>> work = getWorkOfOtherRanks();
 
     upcxx::future<std::string, upcxx::intrank_t> fnd = work.then(
-        [this](std::vector<float> ds) -> upcxx::future<std::string, int>
+        [this](std::vector<double> ds) -> upcxx::future<std::string, int>
         {
             std::string victims;
 
             int maxElementIndex = std::max_element(std::begin(ds), std::end(ds)) - std::begin(ds);
-            float max = ds[maxElementIndex];
+            double max = ds[maxElementIndex];
 
             int minElementIndex = std::min_element(std::begin(ds), std::end(ds)) - std::begin(ds);
-            float min = ds[minElementIndex];
+            double min = ds[minElementIndex];
 
             if (maxElementIndex == upcxx::rank_me() && max >= allowed_imbalance * min)
             {
@@ -2584,14 +2648,14 @@ upcxx::future<std::string, upcxx::intrank_t> DynamicActorGraph::findActorsToOffl
 
     return fnd;
 #else
-    upcxx::future<std::vector<float>> work = getWorkOfOtherRanks();
+    upcxx::future<std::vector<double>> work = getWorkOfOtherRanks();
 
     upcxx::future<std::string, upcxx::intrank_t> fnd = work.then(
-        [this](std::vector<float> ds) -> upcxx::future<std::string, int>
+        [this](std::vector<double> ds) -> upcxx::future<std::string, int>
         {
             std::string victims;
 
-            std::vector<std::pair<upcxx::intrank_t, float>> zipped;
+            std::vector<std::pair<upcxx::intrank_t, double>> zipped;
             zipped.reserve(ds.size() + 1);
 
             for (size_t i = 0; i < ds.size(); i++)
@@ -2666,7 +2730,7 @@ upcxx::future<> DynamicActorGraph::restartActors(const std::unordered_map<std::s
         }
     }
 
-    return util::combineFutures(futs);
+    return util::combineFutures(std::move(futs));
 }
 
 upcxx::future<> DynamicActorGraph::restartActors(const std::set<GlobalActorRef> &migList)
@@ -2690,7 +2754,7 @@ upcxx::future<> DynamicActorGraph::restartActors(const std::set<GlobalActorRef> 
         }
     }
 
-    return util::combineFutures(futs);
+    return util::combineFutures(std::move(futs));
 }
 
 std::tuple<upcxx::future<>, std::vector<GlobalActorRef>>
@@ -2713,7 +2777,7 @@ DynamicActorGraph::rmOldActors(const std::unordered_map<std::string, upcxx::intr
 
     if (!futs.empty())
     {
-        return {util::combineFutures(futs), v};
+        return {util::combineFutures(std::move(futs)), v};
     }
 
     return {upcxx::make_future(), v};
@@ -2776,7 +2840,7 @@ void DynamicActorGraph::sendActorsAsync(const std::vector<GlobalActorRef> &trigs
         unsigned int end = std::min(static_cast<unsigned int>(i + 15), static_cast<unsigned int>(futs.size()));
         std::vector<upcxx::future<>> tmp;
         std::copy(futs.begin() + i, futs.begin() + end, std::back_inserter(tmp));
-        upcxx::future<> f = util::combineFutures(tmp);
+        upcxx::future<> f = util::combineFutures(std::move(tmp));
         i = end;
         f.wait();
     }
@@ -2858,7 +2922,7 @@ upcxx::future<> DynamicActorGraph::reinsert(const std::vector<GlobalActorRef> &r
         }
     }
 
-    return util::combineFutures(futs);
+    return util::combineFutures(std::move(futs));
 }
 
 std::unordered_map<std::string, upcxx::intrank_t>
@@ -2939,7 +3003,7 @@ void DynamicActorGraph::userEnforcedLocalMigrateActorsDiscretePhases(
             v.emplace_back(u);
         }
 
-        upcxx::future<> all = util::combineFutures(v);
+        upcxx::future<> all = util::combineFutures(std::move(v));
 
         upcxx::discharge();
         all.wait();
@@ -3034,7 +3098,7 @@ void DynamicActorGraph::migrateActorsDiscretePhases(std::unordered_map<std::stri
         pgraphrankschanged.push_back(std::move(f));
     }
 
-    upcxx::future<> rc = util::combineFutures(pgraphrankschanged);
+    upcxx::future<> rc = util::combineFutures(std::move(pgraphrankschanged));
 
     upcxx::discharge();
     upcxx::progress();
@@ -3104,7 +3168,7 @@ DynamicActorGraph::rmActorsAsync(const std::unordered_map<std::string, upcxx::in
         }
     }
 
-    upcxx::future<> all = util::combineFutures(futs);
+    upcxx::future<> all = util::combineFutures(std::move(futs));
 
     return {all, refs};
 }
@@ -3131,7 +3195,7 @@ upcxx::future<> DynamicActorGraph::addActorsToAnotherAsync(const std::vector<Glo
         l.push_back(ff);
     }
 
-    upcxx::future<> all = util::combineFutures(l);
+    upcxx::future<> all = util::combineFutures(std::move(l));
     return all;
 }
 
@@ -3398,7 +3462,7 @@ std::tuple<upcxx::future<bool>, size_t> DynamicActorGraph::pin_neighbors(const s
     }
     else
     {
-        upcxx::future<> fut = util::combineFutures(pinned);
+        upcxx::future<> fut = util::combineFutures(std::move(pinned));
 
         upcxx::future<bool> pinned_all = fut.then(
             [this, t, neighbors]() -> upcxx::future<bool>
@@ -3498,7 +3562,7 @@ std::string DynamicActorGraph::getMeAnActor(int marker, int from, int must_borde
     if (order_victims)
     {
         std::set<ActorImpl *> &lacts = this->ag.getLocalActorsRef();
-        std::vector<std::pair<ActorImpl *, float>> zipped;
+        std::vector<std::pair<ActorImpl *, double>> zipped;
         zipped.reserve(lacts.size());
         size_t i = 0;
         for (auto *aref : lacts)
@@ -3577,4 +3641,38 @@ std::string DynamicActorGraph::getMeAnActor(int marker, int from, int must_borde
     }
     std::string s;
     return s;
+}
+
+double DynamicActorGraph::getWork()
+{
+    double c = this->ag.getRandomActorCost();
+    unsigned int tc = 1;
+
+    if constexpr (config::migrationtype == config::MigrationType::ASYNC)
+    {
+        c = -c;
+        tc = -1;
+    }
+
+    double t = 0.0;
+
+    if (this->timetask)
+    {
+        double w = this->ag.getApproxTaskTimeCost();
+        if (c < 0 && -c < w)
+        {
+            t = w - c;
+        }
+        else
+        {
+            t = 0.0;
+        }
+    }
+    else
+    {
+        t = (this->time_spent_for_cost) ? static_cast<double>(this->ag.getWorkDoneForMigration() + c)
+                                        : static_cast<double>(std::max<unsigned int>(this->ag.getTaskCount(), 1) + tc);
+    }
+
+    return t;
 }

@@ -42,9 +42,12 @@ int ActorImpl::event_act = -1;
 
 using namespace std::string_literals;
 
+double ActorImpl::assumed_cost = 100.0;
+
 ActorImpl::ActorImpl(const std::string &name)
     : name(name), parentActorGraph(nullptr), state(ActorState::NeedsActivation), portsInfoApplicable(false),
-      workTokens(0), workTime(0), markedBy{-1}, pinnedBy{0}, index_for_actor_cost(0)
+      workTokens(0), workTime(0), markedBy{-1}, pinnedBy{0}, index_for_actor_cost(0), initial_act(true),
+      terminated(false)
 {
 #ifdef TRACE
     std::string event_act_name = "act";
@@ -56,7 +59,8 @@ ActorImpl::ActorImpl(const std::string &name)
 
 ActorImpl::ActorImpl()
     : name(""), parentActorGraph(nullptr), state(ActorState::NeedsActivation), portsInfoApplicable(false),
-      workTokens(0), workTime(0), markedBy{-1}, pinnedBy{0}, index_for_actor_cost(0)
+      workTokens(0), workTime(0), markedBy{-1}, pinnedBy{0}, index_for_actor_cost(0), initial_act(true),
+      terminated(false)
 {
 #ifdef TRACE
     std::string event_act_name = "act";
@@ -68,7 +72,8 @@ ActorImpl::ActorImpl()
 
 ActorImpl::ActorImpl(std::string &&name)
     : name(std::move(name)), parentActorGraph(nullptr), state(ActorState::NeedsActivation), portsInfoApplicable(false),
-      workTokens(0), workTime(0), markedBy{-1}, pinnedBy{0}, index_for_actor_cost(0)
+      workTokens(0), workTime(0), markedBy{-1}, pinnedBy{0}, index_for_actor_cost(0), initial_act(true),
+      terminated(false)
 {
 #ifdef TRACE
     std::string event_act_name = "act";
@@ -82,9 +87,9 @@ ActorImpl::ActorImpl(ActorImpl &&act)
     : name(std::move(act.name)), parentActorGraph(act.parentActorGraph), inPorts(std::move(act.inPorts)),
       outPorts(std::move(act.outPorts)), state(act.state.load()), portsInformation(std::move(act.portsInformation)),
       portsInfoApplicable(act.portsInfoApplicable), workTokens(act.workTokens), workTime(act.workTime),
-      markedBy(std::move(act.markedBy)), pinnedBy{0}, pin_count(std::move(act.pin_count)),
-      actor_cost(std::move(act.actor_cost)), index_for_actor_cost(act.index_for_actor_cost),
-      initial_act(act.initial_act), terminated(act.terminated)
+      markedBy(act.markedBy), pinnedBy{0}, pin_count(std::move(act.pin_count)), actor_cost(std::move(act.actor_cost)),
+      index_for_actor_cost(act.index_for_actor_cost), calls(act.calls), initial_act(act.initial_act),
+      terminated(act.terminated), acted(act.acted)
 {
     if (portsInfoBadState())
     {
@@ -115,48 +120,9 @@ ActorImpl::ActorImpl(ActorImpl &&act)
     {
         throw std::runtime_error("After a fresh move constructor the port information should be applicable");
     }
-}
 
-ActorImpl &ActorImpl::operator=(ActorImpl &&act)
-{
-    name = std::move(act.name);
-    parentActorGraph = act.parentActorGraph;
-    state = act.state.load();
-    portsInformation = std::move(act.portsInformation);
-    portsInfoApplicable = act.portsInfoApplicable;
-    act.portsInfoApplicable = false;
-    workTokens = act.workTokens;
-    workTime = act.workTime;
-    markedBy = std::move(act.markedBy);
-    pinnedBy = act.pinnedBy;
-    pin_count = std::move(act.pin_count);
-    actor_cost = std::move(act.actor_cost);
-    index_for_actor_cost = act.index_for_actor_cost;
-
-    inPorts = std::move(act.inPorts);
-    outPorts = std::move(act.outPorts);
-    terminated = act.terminated;
-
-    for (auto &pr : inPorts)
-    {
-        pr.second->connectedActor = this;
-    }
-
-    for (auto &pr : outPorts)
-    {
-        pr.second->connectedActor = this;
-    }
-
-    if (terminated)
-    {
-        state = ActorState::Terminated;
-    }
-
-    if (!portsInfoApplicable)
-    {
-        throw std::runtime_error("After a fresh move constructor the port information should be applicable");
-    }
-    return *this;
+    act.outPorts.clear();
+    act.inPorts.clear();
 }
 
 void ActorImpl::update_ports(std::vector<AbstractInPort *> ins, std::vector<AbstractOutPort *> outs)
@@ -197,7 +163,7 @@ ActorImpl::ActorImpl(ActorData &&data,
     : name(std::move(data.name)), parentActorGraph(nullptr), inPorts(), outPorts(), state(data.state),
       portsInformation(std::move(portsInformation)), portsInfoApplicable(true), workTokens(data.workTokens),
       workTime(data.workTime), markedBy(data.mark), actor_cost(std::move(data.actor_cost)),
-      index_for_actor_cost(data.index), initial_act(data.initial_act), terminated(data.term)
+      index_for_actor_cost(data.index), initial_act(data.initial_act), terminated(data.term), acted(data.acted)
 {
 #ifdef TRACE
     std::string event_act_name = "act";
@@ -220,9 +186,9 @@ ActorImpl::ActorImpl(ActorData &&data,
 
 ActorImpl::ActorImpl(ActorData &&data)
     : name(std::move(data.name)), parentActorGraph(nullptr), inPorts(), outPorts(),
-      state(data.state), portsInformation{}, portsInfoApplicable(true), workTokens(data.workTokens),
+      state(data.state), portsInformation{}, portsInfoApplicable(false), workTokens(data.workTokens),
       workTime(data.workTime), markedBy(data.mark), actor_cost(std::move(data.actor_cost)),
-      index_for_actor_cost(data.index), initial_act(data.initial_act), terminated(data.term)
+      index_for_actor_cost(data.index), initial_act(data.initial_act), terminated(data.term), acted(data.acted)
 {
 #ifdef TRACE
     std::string event_act_name = "act";
@@ -405,6 +371,7 @@ bool ActorImpl::startWithCaller(upcxx::intrank_t caller)
     if (this->state.load() == ActorState::Terminated || terminated)
     {
         markedBy = -1;
+
         return true;
     }
 
@@ -449,6 +416,22 @@ bool ActorImpl::startWithCaller(upcxx::intrank_t caller)
         set_port_size();
 
         clearPortInformation();
+
+        unsigned int *tc = this->parentActorGraph->taskCount->local();
+
+        *tc += canActNTimes();
+
+        if (initial_act)
+        {
+            *this->parentActorGraph->approxTaskCost->local() += ActorImpl::assumed_cost;
+        }
+        else
+        {
+            *this->parentActorGraph->approxTaskCost->local() += canActNTimes() * getCost();
+        }
+
+        *this->parentActorGraph->gatheredCost->local() += getCost();
+
         return true;
     }
 
@@ -467,7 +450,7 @@ bool ActorImpl::tryLock(ActorState expected, ActorState desired)
 
 bool ActorImpl::mark(upcxx::intrank_t marker)
 {
-    if (!acted || isMarked() || isPinned() || state != ActorState::Running || initial_act || terminated)
+    if (acted == 0 || isMarked() || isPinned() || state != ActorState::Running || initial_act || terminated)
     {
         return false;
     }
@@ -653,7 +636,6 @@ bool ActorImpl::stopWithCaller(ActorState as, upcxx::intrank_t caller)
         if (this->state.compare_exchange_strong(run, ActorState::Transitioning))
         {
             this->parentActorGraph->activeActorCount -= 1;
-            this->state = as;
 
 #if defined(REPORT_MAIN_ACTIONS)
             //  std::cout << "Stopping actor:" << this->getName() << " on rank: " << upcxx::rank_me()
@@ -661,6 +643,33 @@ bool ActorImpl::stopWithCaller(ActorState as, upcxx::intrank_t caller)
             //            << this->parentActorGraph->actorCount << std::endl;
 #endif
 
+            if (as == ActorState::TemporaryStoppedForMigration)
+            {
+                unsigned int *tc = this->parentActorGraph->taskCount->local();
+                if (*tc < canActNTimes())
+                {
+                    // throw std::runtime_error("TaskCount underflow at rm");
+                    *tc = 0;
+                }
+                else
+                {
+                    *tc -= canActNTimes();
+                }
+            }
+
+            if (initial_act)
+            {
+                *this->parentActorGraph->approxTaskCost->local() -= ActorImpl::assumed_cost;
+            }
+            else
+            {
+                *this->parentActorGraph->approxTaskCost->local() -= canActNTimes() * getCost();
+            }
+
+            *this->parentActorGraph->gatheredCost->local() -= getCost();
+
+            terminated = (as == ActorState::Terminated);
+            this->state = as;
             return true;
         }
     }
@@ -688,6 +697,8 @@ bool ActorImpl::stopFromAct()
         unsigned int *tc = this->parentActorGraph->taskCount->local();
         if (*tc < this->canActNTimes())
         {
+            // std::cout << "Terminate " << name << " can still act " << this->canActNTimes() << " times" << std::endl;
+
             // throw std::runtime_error("task count underflow during termination");
             *tc = 0;
         }
@@ -696,10 +707,19 @@ bool ActorImpl::stopFromAct()
             *tc -= this->canActNTimes();
         }
 
+        if (initial_act)
+        {
+            *this->parentActorGraph->approxTaskCost->local() -= ActorImpl::assumed_cost;
+        }
+        else
+        {
+            *this->parentActorGraph->approxTaskCost->local() -= canActNTimes() * getCost();
+        }
+
         this->parentActorGraph->activeActorCount -= 1;
         this->state = ActorState::Terminated;
         this->parentActorGraph->has_a_terminated_actor = true;
-        terminated = true;
+        this->terminated = true;
         // if it is stopped then it should have the mark of the caller
 
 #if defined(REPORT_MAIN_ACTIONS)
@@ -719,7 +739,7 @@ void ActorImpl::b_act()
     {
         // throw std::runtime_error("TaskCount underflow " + std::to_string(*tc) + " " +
         //                          std::to_string(this->canActNTimes()));
-        *tc = 0;
+        //*tc = 0;
     }
     else
     {
@@ -744,10 +764,8 @@ void ActorImpl::b_act()
         }
     }
 
-    initial_act = false;
-
     workTokens += 1;
-    tbegin = std::chrono::steady_clock::now();
+    auto tbegin = std::chrono::steady_clock::now();
 #ifdef TRACE
     VT_begin(ActorImpl::event_act);
 #endif
@@ -758,14 +776,15 @@ void ActorImpl::b_act()
     VT_end(ActorImpl::event_act);
 #endif
 
-    tend = std::chrono::steady_clock::now();
-    size_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(tend - tbegin).count();
+    auto tend = std::chrono::steady_clock::now();
+    int64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(tend - tbegin).count();
 
     workTime += elapsed;
 
     this->portsInfoApplicable = false;
 
-    actor_cost[index_for_actor_cost] = (elapsed >> 6);
+    double cost_before = this->getCost();
+    actor_cost[index_for_actor_cost] = static_cast<double>(elapsed) / static_cast<double>(100000.0);
     index_for_actor_cost += 1;
     if (index_for_actor_cost == history_array_length)
     {
@@ -775,7 +794,24 @@ void ActorImpl::b_act()
     this->parentActorGraph->addToWork(elapsed);
     calls += 1;
 
-    acted = true;
+    acted += 1;
+
+    double cost_after = this->getCost();
+
+    if (!initial_act)
+    {
+        *(this->parentActorGraph->gatheredCost->local()) += cost_after;
+        *(this->parentActorGraph->gatheredCost->local()) -= cost_before;
+        *(this->parentActorGraph->approxTaskCost->local()) -= (this->canActNTimes() + 1) * cost_before;
+        *(this->parentActorGraph->approxTaskCost->local()) += this->canActNTimes() * cost_after;
+    }
+    else
+    {
+        *(this->parentActorGraph->gatheredCost->local()) += cost_after;
+        *(this->parentActorGraph->approxTaskCost->local()) -= ActorImpl::assumed_cost;
+    }
+
+    initial_act = false;
 }
 
 bool ActorImpl::needsReactivation() { return this->state == ActorState::NeedsActivation; }
@@ -1206,8 +1242,8 @@ uint64_t ActorImpl::calc_cost()
 
         if (actor_cost[i] != 0)
         {
-            cost = static_cast<uint64_t>((static_cast<float>(actor_cost[i])) /
-                                         (static_cast<float>(util::intPow(2, diff))));
+            cost = static_cast<uint64_t>((static_cast<double>(actor_cost[i])) /
+                                         (static_cast<double>(util::intPow(2, diff))));
             sum += cost;
         }
         else
@@ -1410,7 +1446,7 @@ bool ActorImpl::hasNoMessages() const
     return true;
 }
 
-bool ActorImpl::checkTerminated() const { return false; }
+bool ActorImpl::checkTerminated() const { return terminated; }
 
 size_t canActNTimesL(std::vector<std::pair<std::string, size_t>> &msgs)
 {
@@ -1505,7 +1541,35 @@ void ActorImpl::addTask(const std::string &increased_port_name)
 
         if (a != b)
         {
-            this->parentActorGraph->addTask();
+            this->parentActorGraph->addTask(this->getCost());
         }
     }
 }
+
+double ActorImpl::getCost() const
+{
+    if (index_for_actor_cost == 0)
+    {
+        return actor_cost[actor_cost.size() - 1];
+    }
+    else
+    {
+        return actor_cost[index_for_actor_cost - 1];
+    }
+}
+
+void ActorImpl::addCost(double additional_cost)
+{
+    if (index_for_actor_cost == 0)
+    {
+        actor_cost[actor_cost.size() - 1] += additional_cost;
+        *this->parentActorGraph->gatheredCost->local() += additional_cost;
+    }
+    else
+    {
+        actor_cost[index_for_actor_cost - 1] += additional_cost;
+        *this->parentActorGraph->gatheredCost->local() += additional_cost;
+    }
+}
+
+uint64_t ActorImpl::getPastExecutionCount() const { return this->acted; }

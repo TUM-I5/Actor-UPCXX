@@ -112,7 +112,7 @@ class SWE_WaveAccumulationBlock : public SWE_Block
 
         template <typename Reader> static SWE_WaveAccumulationBlock *deserialize(Reader &reader, void *storage)
         {
-            SWEBlockData bd = reader.template read<SWEBlockData>();
+            SWEBlockData bd = reader.template read<SWE_Block>();
             Float2D hNetUpdates = reader.template read<Float2D>();
             Float2D huNetUpdates = reader.template read<Float2D>();
             Float2D hvNetUpdates = reader.template read<Float2D>();

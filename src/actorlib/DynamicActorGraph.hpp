@@ -53,7 +53,7 @@ class DynamicActorGraph : public MigrationDispatcher
     // std::shared_mutex mark_lock;
     // std::vector<bool> used;
     std::vector<std::pair<bool, std::unordered_map<GlobalActorRef, bool>>> pins;
-    std::vector<float> buffer;
+    std::vector<double> buffer;
     bool dont_use_buffer = false;
     // bool losing = false;
     std::set<int> stealing_from_me{};
@@ -77,6 +77,7 @@ class DynamicActorGraph : public MigrationDispatcher
     bool time_spent_for_cost = true;
     bool contigious_migration = false;
     bool use_rma = false;
+    bool timetask = false;
 
     bool processing_steal_request = false;
 
@@ -132,6 +133,7 @@ class DynamicActorGraph : public MigrationDispatcher
         constexpr char userma[] = "RMA_TASKCOUNT";
         constexpr char syncinit[] = "SLOW_INIT";
         constexpr char codemode[] = "UPCXX_CODEMODE";
+        constexpr char usetimetask[] = "USE_BOTH";
 
         util::parseBooleanEnvVar(order, order_victims);
         util::parseBooleanEnvVar(stealdurterm, steal_during_termination);
@@ -139,6 +141,7 @@ class DynamicActorGraph : public MigrationDispatcher
         util::parseBooleanEnvVar(continousmig, contigious_migration);
         util::parseBooleanEnvVar(userma, use_rma);
         util::parseBooleanEnvVar(syncinit, sync_init);
+        util::parseBooleanEnvVar(usetimetask, timetask);
 
         char *val = getenv(codemode);
         if (val != nullptr)
@@ -177,13 +180,21 @@ class DynamicActorGraph : public MigrationDispatcher
             std::cerr << "Config: Order victims: " << order_victims << std::endl;
             std::cerr << "Config: Contigious migration: " << contigious_migration << std::endl;
 
-            if (time_spent_for_cost)
+            if (!timetask)
             {
-                std::cerr << "Config: Using time spent in act() as the base for migration." << std::endl;
+                if (time_spent_for_cost)
+                {
+                    std::cerr << "Config: Using time spent in act as the base for migration." << std::endl;
+                }
+                else
+                {
+                    std::cerr << "Config: Using task count as the base for migration." << std::endl;
+                }
             }
             else
             {
-                std::cerr << "Config: Using task count as the base for migration." << std::endl;
+                std::cerr << "Config: Using task count combined with actor cost as the base for migration."
+                          << std::endl;
             }
 
 #ifdef USE_ACTOR_TRIGGERS
@@ -191,7 +202,7 @@ class DynamicActorGraph : public MigrationDispatcher
 #else
             std::cerr << "Config: Not using actor triggers" << std::endl;
 #endif
-            if (use_rma && !time_spent_for_cost)
+            if (use_rma)
             {
                 std::cerr << "Config: Using rma to exchange task info." << std::endl;
             }
@@ -314,9 +325,9 @@ class DynamicActorGraph : public MigrationDispatcher
     void phases(); // fires the migration phase, it redistributed actors and calls the migration::migrateDiscretePhases
                    // for bulk migration
 
-    upcxx::future<std::vector<float>> getWorkOfOtherRanks(const std::set<int> &ranks);
+    upcxx::future<std::vector<double>> getWorkOfOtherRanks(const std::set<int> &ranks);
 
-    upcxx::future<std::vector<float>> getWorkOfOtherRanks();
+    upcxx::future<std::vector<double>> getWorkOfOtherRanks();
 
   public:
     virtual upcxx::future<GlobalActorRef> sendActorToAsync(int rank, std::string const &name) = 0;
@@ -348,12 +359,14 @@ class DynamicActorGraph : public MigrationDispatcher
 
     upcxx::future<std::string, upcxx::intrank_t> findActorsToOffload() override final;
 
-    bool tryToAcquireLockForActor(const std::string name, const upcxx::intrank_t marker, float workofother);
+    bool tryToAcquireLockForActor(const std::string name, const upcxx::intrank_t marker, double workload);
 
   public:
     upcxx::future<bool> tryToMarkActorForMigration(const std::string name) override final;
 
     upcxx::future<bool> tryStopSelfAndPinNeighborhood(const std::string name) override final;
+
+    double getWork();
 
   private:
     upcxx::future<> severeConnections(const std::string &name);

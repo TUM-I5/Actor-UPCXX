@@ -69,10 +69,10 @@ struct SimulationArea
         template <typename Reader> static SimulationArea *deserialize(Reader &reader, void *storage)
         {
 
-            int a = reader.template read<int>();
-            int b = reader.template read<int>();
-            int c = reader.template read<int>();
-            int d = reader.template read<int>();
+            float a = reader.template read<float>();
+            float b = reader.template read<float>();
+            float c = reader.template read<float>();
+            float d = reader.template read<float>();
             SimulationArea *sa = ::new (storage) SimulationArea(a, b, c, d);
             return sa;
         }

@@ -127,6 +127,8 @@ class PortGraph
 
     std::set<int> borderingRanks(upcxx::intrank_t rank) const; // returns the ranks that border the rank rank
 
+    std::set<int> emptyRanks() const;
+
     const Node &getNode(const std::string &name) const;
 
     std::tuple<std::string, std::string, std::string, std::string> getConnection(const std::string &from,

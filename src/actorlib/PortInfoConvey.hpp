@@ -125,7 +125,7 @@ template <class type, int capacity> class PortsInformationReader
         {
             std::unique_ptr<InPortInformationBase> upp(util::read<Reader, InPortInformation<type, capacity>>(reader));
             // upp = std::move(up);
-            arr.emplace_back(std::move(upp));
+            arr.push_back(std::move(upp));
         }
         return arr;
     }
@@ -138,7 +138,7 @@ template <class type, int capacity> class PortsInformationReader
         {
             std::unique_ptr<OutPortInformationBase> upp(util::read<Reader, OutPortInformation<type, capacity>>(reader));
             // upp = std::move(up);
-            arr.emplace_back(std::move(upp));
+            arr.push_back(std::move(upp));
         }
         return arr;
     }

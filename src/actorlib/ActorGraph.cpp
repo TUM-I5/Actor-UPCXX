@@ -65,7 +65,9 @@ ActorGraph::ActorGraph(MigrationDispatcher *dag, PortGraph *pg)
 #else
       activeActorCount(0), rpcsInFlight(0), lpcsInFlight(0),
 #endif
-      taskCount(upcxx::new_<unsigned int>(0))
+      taskCount(upcxx::new_<unsigned int>(0)), gatheredCost(upcxx::new_<double>(0.0)),
+      approxTaskCost(upcxx::new_<double>(0.0)), messages_sent(upcxx::rank_n(), 0),
+      migration_succeeded(upcxx::rank_n(), 0)
 {
     if (!upcxx::rank_me())
     {
@@ -74,9 +76,10 @@ ActorGraph::ActorGraph(MigrationDispatcher *dag, PortGraph *pg)
 
     auto a = util::timepoint();
 
-    gptrsToTaskCounts.resize(upcxx::rank_n());
+    gptrsToTaskCounts.resize(upcxx::rank_n(), nullptr);
+
     std::vector<upcxx::future<>> v;
-    v.reserve(upcxx::rank_n() - 1);
+    v.reserve(upcxx::rank_n());
     for (int i = 0; i < upcxx::rank_n(); i++)
     {
         if (i == upcxx::rank_me())
@@ -85,6 +88,7 @@ ActorGraph::ActorGraph(MigrationDispatcher *dag, PortGraph *pg)
         }
         upcxx::future<upcxx::global_ptr<unsigned int>> tfut = taskCount.fetch(i);
         upcxx::future<> f = tfut.then([this, i](upcxx::global_ptr<unsigned int> gptr) { gptrsToTaskCounts[i] = gptr; });
+
         v.push_back(std::move(f));
     }
 
@@ -93,11 +97,55 @@ ActorGraph::ActorGraph(MigrationDispatcher *dag, PortGraph *pg)
     ptrexchanged.wait();
 
     upcxx::barrier();
+
+    gptrsToGatheredCosts.resize(upcxx::rank_n(), nullptr);
+
+    std::vector<upcxx::future<>> vv;
+    vv.reserve(upcxx::rank_n());
+    for (int i = 0; i < upcxx::rank_n(); i++)
+    {
+        if (i == upcxx::rank_me())
+        {
+            continue;
+        }
+        upcxx::future<upcxx::global_ptr<double>> ffut2 = gatheredCost.fetch(i);
+        upcxx::future<> ff = ffut2.then([this, i](upcxx::global_ptr<double> gptr) { gptrsToGatheredCosts[i] = gptr; });
+        vv.push_back(std::move(ff));
+    }
+    upcxx::discharge();
+    upcxx::future<> ptrexchanged2 = util::combineFutures(std::move(vv));
+    ptrexchanged2.wait();
+
+    upcxx::barrier();
+
+    gptrsToApproxTaskCosts.resize(upcxx::rank_n(), nullptr);
+
+    std::vector<upcxx::future<>> vvv;
+    vvv.reserve(upcxx::rank_n());
+    for (int i = 0; i < upcxx::rank_n(); i++)
+    {
+        if (i == upcxx::rank_me())
+        {
+            continue;
+        }
+        upcxx::future<upcxx::global_ptr<double>> tfut3 = approxTaskCost.fetch(i);
+        upcxx::future<> fff =
+            tfut3.then([this, i](upcxx::global_ptr<double> gptr) { gptrsToApproxTaskCosts[i] = gptr; });
+
+        vvv.push_back(std::move(fff));
+    }
+
+    upcxx::discharge();
+    upcxx::future<> ptrexchanged3 = util::combineFutures(std::move(vvv));
+    ptrexchanged3.wait();
+
+    upcxx::barrier();
+
     auto b = util::timerDifference(a);
-    // if (upcxx::rank_me() == 0)
-    //{
-    //     std::cout << "Exchanging global pointers took: " << b << " seconds" << std::endl;
-    // }
+    if (upcxx::rank_me() == 0)
+    {
+        std::cout << "Exchanging global pointers took: " << b << " seconds" << std::endl;
+    }
 }
 
 void ActorGraph::addActor(Actor *a) { addActor(&(a->asBase())); }
@@ -116,9 +164,6 @@ upcxx::future<> ActorGraph::addActorAsync(ActorImpl *a)
     actorCount += 1;
     checkInsert(a->name, aGPtr);
     this->workDone += std::get<1>(a->getWork());
-
-    unsigned int *tc = this->taskCount->local();
-    *tc += a->canActNTimes();
 
     upcxx::promise<> allDone;
     for (int i = 0; i < upcxx::rank_n(); i++)
@@ -156,8 +201,6 @@ upcxx::future<> ActorGraph::addActorAsync(std::vector<ActorImpl *> &actors)
         checkInsert(a->name, aGPtr);
         this->workDone += std::get<1>(a->getWork());
 
-        unsigned int *tc = this->taskCount->local();
-        *tc += a->canActNTimes();
         grefs.push_back(aGPtr);
         gnames.push_back(a->getName());
     }
@@ -195,7 +238,7 @@ upcxx::future<> ActorGraph::addActorToAnotherAsync(GlobalActorRef a, upcxx::intr
                                  "destination rank no fulfilled");
     }
 
-    if (rank == upcxx::rank_me())
+    if (a.where() == upcxx::rank_me())
     {
         ActorImpl *act = *a.local();
         act->parentActorGraph = this;
@@ -209,9 +252,6 @@ upcxx::future<> ActorGraph::addActorToAnotherAsync(GlobalActorRef a, upcxx::intr
         this->checkInsert(act->getName(), a);
         actorCount += 1;
         this->workDone += std::get<1>(act->getWork());
-
-        unsigned int *tc = this->taskCount->local();
-        *tc += act->canActNTimes();
 
         upcxx::promise<> allDone;
         for (int i = 0; i < upcxx::rank_n(); i++)
@@ -269,8 +309,8 @@ upcxx::future<> ActorGraph::addActorToAnotherAsync(GlobalActorRef a, upcxx::intr
                         (*rag)->actorCount += 1;
                         (*rag)->workDone += std::get<1>(a->getWork());
 
-                        unsigned int *tc = (*rag)->taskCount->local();
-                        *tc += a->canActNTimes();
+                        // unsigned int *tc = (*rag)->taskCount->local();
+                        //*tc += a->canActNTimes();
                     },
                     remoteGraphComponents, a);
 
@@ -306,7 +346,7 @@ std::tuple<upcxx::future<>, GlobalActorRef> ActorGraph::rmActorAsync(const std::
 
     if (a.where() == upcxx::rank_me())
     {
-        unsigned int *tc = this->taskCount->local();
+        // unsigned int *tc = this->taskCount->local();
         ActorImpl *x = *a.local();
         unorderedLocalActors.erase(x);
         // should already be stopped
@@ -321,16 +361,6 @@ std::tuple<upcxx::future<>, GlobalActorRef> ActorGraph::rmActorAsync(const std::
         bool couldrm = checkRm(x->getName());
         actorCount -= 1;
         this->workDone -= std::get<1>(x->getWork());
-
-        if (*tc < x->canActNTimes())
-        {
-            // throw std::runtime_error("TaskCount underflow at rm");
-            *tc = 0;
-        }
-        else
-        {
-            *tc -= x->canActNTimes();
-        }
 
         if (!couldrm)
         {
@@ -383,7 +413,7 @@ std::tuple<upcxx::future<>, GlobalActorRef> ActorGraph::rmActorAsync(const std::
 
                         ActorImpl *a = *aref.local();
 
-                        unsigned int *tc = ((*rag)->taskCount->local());
+                        // unsigned int *tc = ((*rag)->taskCount->local());
 
                         size_t erased = (*rag)->localActors.erase(a);
                         (*rag)->unorderedLocalActors.erase(a);
@@ -396,16 +426,6 @@ std::tuple<upcxx::future<>, GlobalActorRef> ActorGraph::rmActorAsync(const std::
                         (*rag)->checkRm(actorName);
                         (*rag)->actorCount -= 1;
                         (*rag)->workDone -= std::get<1>(a->getWork());
-
-                        if (*tc < a->canActNTimes())
-                        {
-                            // throw std::runtime_error("TaskCount underflow at rm");
-                            *tc = 0;
-                        }
-                        else
-                        {
-                            *tc -= a->canActNTimes();
-                        }
                     },
                     remoteGraphComponents, name);
             }
@@ -930,12 +950,12 @@ void ActorGraph::addToWork(uint64_t time)
 
 std::tuple<uint64_t, uint64_t> ActorGraph::getTotalWork() const { return {this->totalTokens, this->totalTime}; }
 
-uint64_t ActorGraph::getWorkDoneForMigration() const
+double ActorGraph::getWorkDoneForMigration() const
 { // return this->workDone;
-    uint64_t u = 0;
+    double u = 0;
     for (auto *ai : localActors)
     {
-        u += static_cast<uint64_t>(ai->getCost());
+        u += (ai->getCost());
     }
     return u;
 }
@@ -1031,9 +1051,9 @@ std::set<ActorImpl *> &ActorGraph::getLocalActorsRef() { return localActors; }
 
 std::unordered_set<ActorImpl *> &ActorGraph::getUnorderedLocalActorsRef() { return unorderedLocalActors; }
 
-float ActorImpl::getCost() const { return actor_cost[index_for_actor_cost]; }
-
 unsigned int ActorGraph::getTaskCount() const { return taskDeque.getTaskCount(); }
+
+double ActorGraph::getApproxTaskTimeCost() const { return *approxTaskCost->local(); }
 
 bool ActorGraph::validPointer(ActorImpl *ai) const
 {
@@ -1041,10 +1061,12 @@ bool ActorGraph::validPointer(ActorImpl *ai) const
     return in_local_map;
 }
 
-void ActorGraph::addTask()
+void ActorGraph::addTask(double cost)
 {
     unsigned int *tc = this->taskCount->local();
     *tc += 1;
+
+    *(this)->approxTaskCost->local() += cost;
 }
 
 unsigned int ActorGraph::getTaskCountActive() const
@@ -1055,4 +1077,101 @@ unsigned int ActorGraph::getTaskCountActive() const
         tc += a->canActNTimes();
     }
     return tc;
+}
+
+double ActorGraph::getActorCostActive() const
+{
+    double tc = 0;
+    for (const auto *a : localActors)
+    {
+        tc += a->getCost();
+    }
+    return tc;
+}
+
+double ActorGraph::getApproxTaskTimeCostActive() const
+{
+    double tc = 0.0;
+    for (const auto *a : localActors)
+    {
+        tc += a->canActNTimes() * a->getCost();
+    }
+    return tc;
+}
+
+double ActorGraph::getRandomActorCost() const
+{
+    if (unorderedLocalActors.empty())
+    {
+        return 0.0;
+    }
+    return (*this->unorderedLocalActors.begin())->getCost();
+}
+
+std::pair<double, std::string> ActorGraph::getMaxActorCost() const
+{
+    double max = -1.0;
+    std::string name;
+    if (unorderedLocalActors.empty())
+    {
+        return std::make_pair(std::move(max), std::move(name));
+    }
+    for (auto *a : unorderedLocalActors)
+    {
+        if (a->getCost() > max)
+        {
+            max = a->getCost();
+            name = a->getName();
+        }
+    }
+    return std::make_pair(std::move(max), std::move(name));
+}
+
+void ActorGraph::register_message(upcxx::intrank_t to) { messages_sent[to] += 1; }
+
+void ActorGraph::register_migration(upcxx::intrank_t endpoint) { migration_succeeded[endpoint] += 1; }
+
+upcxx::future<> ActorGraph::reduce_communicaiton_matrix(std::vector<std::vector<uint64_t>> &matrix)
+{
+    std::vector<upcxx::future<>> scc;
+    scc.reserve(upcxx::rank_n() - 1);
+    for (int i = 0; i < upcxx::rank_n(); i++)
+    {
+        if (i == upcxx::rank_me())
+        {
+            matrix[i] = this->messages_sent;
+        }
+        else
+        {
+            upcxx::future<std::vector<uint64_t>> rcv = upcxx::rpc(
+                i, [](upcxx::dist_object<ActorGraph *> &rmt) { return (*rmt)->messages_sent; }, remoteGraphComponents);
+            upcxx::future<> inst =
+                rcv.then([this, i, &matrix](std::vector<uint64_t> rcv) { matrix[i] = std::move(rcv); });
+            scc.push_back(std::move(inst));
+        }
+    }
+    return util::combineFutures(std::move(scc));
+}
+
+upcxx::future<> ActorGraph::reduce_migration_matrix(std::vector<std::vector<uint64_t>> &matrix)
+{
+    std::vector<upcxx::future<>> scc;
+    scc.reserve(upcxx::rank_n() - 1);
+    for (int i = 0; i < upcxx::rank_n(); i++)
+    {
+        if (i == upcxx::rank_me())
+        {
+            matrix[i] = this->migration_succeeded;
+        }
+        else
+        {
+            upcxx::future<std::vector<uint64_t>> rcv = upcxx::rpc(
+                i, [](upcxx::dist_object<ActorGraph *> &rmt) { return (*rmt)->migration_succeeded; },
+                remoteGraphComponents);
+            upcxx::future<> inst =
+                rcv.then([this, i, &matrix](std::vector<uint64_t> rcv) { matrix[i] = std::move(rcv); });
+            scc.push_back(std::move(inst));
+        }
+    }
+    return util::combineFutures(std::move(scc));
 }

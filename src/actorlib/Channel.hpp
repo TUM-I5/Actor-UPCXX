@@ -234,6 +234,11 @@ void Channel<type, capacity>::applyChannelInfo(int last, int first, bool full, s
 template <typename type, int capacity>
 void Channel<type, capacity>::applyChannelInfo(std::unique_ptr<InPortInformation<type, capacity>> &&ipo)
 {
+    if (lastElement != 0 || firstElement != 0 || isFull != false)
+    {
+        throw std::runtime_error("Double channel info, or apply channel info not applied to a crisp channel!");
+    }
+
     lastElement = ipo->lastEl;
     firstElement = ipo->firstEl;
     isFull = ipo->full;

@@ -238,7 +238,8 @@ upcxx::future<GlobalActorRef> SingleActorAGraph<ActorType>::retrieveFromOutsideA
                         ActorType *aptr = a.begin().deserialize_into(storage);
                         return aptr;
                     },
-                    upcxx::make_view(std::make_move_iterator(downed), std::make_move_iterator(downed + 1)));
+                    // upcxx::make_view(std::make_move_iterator(downed), std::make_move_iterator(downed + 1)));
+                    upcxx::make_view(downed, downed + 1));
             },
             upcxx::rank_me(), r);
         upcxx::future<ActorImpl *> ar =
@@ -364,8 +365,8 @@ upcxx::future<GlobalActorRef> SingleActorAGraph<ActorType>::sendActorToAsync(int
                     (*rsaag)->allocated_actors += 1;
                     return r;
                 },
-                upcxx::make_view(std::make_move_iterator(downcasted), std::make_move_iterator(downcasted + 1)),
-                this->remoteComponents);
+                // upcxx::make_view(std::make_move_iterator(downcasted), std::make_move_iterator(downcasted + 1)),
+                upcxx::make_view(downcasted, downcasted + 1), this->remoteComponents);
 
             // Do not delete "del remains" delete them
             // and act should be deleted after the future is completed
@@ -403,8 +404,8 @@ upcxx::future<GlobalActorRef> SingleActorAGraph<ActorType>::sendActorToAsync(int
                             (*rsaag)->allocated_actors += 1;
                             return r;
                         },
-                        upcxx::make_view(std::make_move_iterator(act), std::make_move_iterator(act + 1)),
-                        this->remoteComponents);
+                        // upcxx::make_view(std::make_move_iterator(act), std::make_move_iterator(act + 1)),
+                        upcxx::make_view(act, act + 1), this->remoteComponents);
                     return tmp;
                 });
 

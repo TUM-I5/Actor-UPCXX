@@ -57,7 +57,7 @@ SWE_Block::SWE_Block(int l_nx, int l_ny, float l_dx, float l_dy)
       b(nx + 2, ny + 2),
       // r(nx + 2, ny + 2),
       // This three are only set here, so eclipse does not complain
-      maxTimestep(0), offsetX(0), offsetY(0)
+      maxTimestep(0.0), offsetX(0.0), offsetY(0.0)
 {
     // set WALL as default boundary condition
     for (int i = 0; i < 4; i++)
@@ -171,10 +171,10 @@ void SWE_Block::initScenario(float _offsetX, float _offsetY, const Scenario &i_s
     synchAfterWrite();
 }
 
-void SWE_Block::reinitScenario(float _offsetX, float _offsetY, const Scenario &i_scenario, const bool i_multipleBlocks)
+void SWE_Block::reinitScenario(const Scenario &i_scenario, const bool i_multipleBlocks)
 {
-    offsetX = _offsetX;
-    offsetY = _offsetY;
+    // offsetX = _offsetX;
+    // offsetY = _offsetY;
 
     // in the case of multiple blocks the calling routine takes care about
     // proper boundary conditions.

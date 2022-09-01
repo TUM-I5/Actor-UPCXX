@@ -839,6 +839,27 @@ std::set<int> PortGraph::borderingRanks(int rank) const
     return ret;
 }
 
+std::set<int> PortGraph::emptyRanks() const
+{
+    std::set<int> populated_ranks;
+    std::set<int> empty_ranks;
+    
+    for (auto &pr : ranks)
+    {
+        populated_ranks.insert(pr.second);
+    }
+
+    for (int i = 0; i<upcxx::rank_n(); i++)
+    {
+        if (populated_ranks.find(i)==populated_ranks.end())
+        {
+            empty_ranks.insert(i);
+        }
+    }
+
+    return empty_ranks;
+}
+
 std::tuple<std::string, std::string, std::string, std::string> PortGraph::getConnection(const std::string &from,
                                                                                         const std::string &to)
 {

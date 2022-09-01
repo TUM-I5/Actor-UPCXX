@@ -142,6 +142,7 @@ class Float2D
     {
         other.rows = 0;
         other.cols = 0;
+        other.elem.clear();
     }
 
     Float2D(const Float2D &other)

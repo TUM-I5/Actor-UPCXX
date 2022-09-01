@@ -110,7 +110,18 @@ class ActorGraph
   public:
     std::mutex tc_mut;
     upcxx::dist_object<upcxx::global_ptr<unsigned int>> taskCount;
+    upcxx::dist_object<upcxx::global_ptr<double>> gatheredCost;
+    upcxx::dist_object<upcxx::global_ptr<double>> approxTaskCost;
     std::vector<upcxx::global_ptr<unsigned int>> gptrsToTaskCounts{};
+    std::vector<upcxx::global_ptr<double>> gptrsToGatheredCosts{};
+    std::vector<upcxx::global_ptr<double>> gptrsToApproxTaskCosts{};
+
+    std::vector<uint64_t> messages_sent;
+    std::vector<uint64_t> migration_succeeded;
+    bool reject_migration = false;
+
+    void register_message(upcxx::intrank_t to);
+    void register_migration(upcxx::intrank_t endpoint);
 
     ActorGraph(MigrationDispatcher *dag, PortGraph *pg);
     ~ActorGraph();
@@ -168,7 +179,7 @@ class ActorGraph
     double run();         // runs ActorGraph until no work is left
     std::tuple<uint64_t, uint64_t> calcRankWork() const; // calculates ranks total work (sum of all actors)
     std::tuple<uint64_t, uint64_t> getTotalWork() const; // returns the total tracked work by this rank
-    uint64_t getWorkDoneForMigration() const;
+    double getWorkDoneForMigration() const;
     std::optional<size_t> getActorTriggerCount(const std::string &name);
     TaskDeque *getTaskDeque();
     upcxx::future<> changeRef(const std::string &name, GlobalActorRef ref);
@@ -184,7 +195,14 @@ class ActorGraph
     std::unordered_set<ActorImpl *> &getUnorderedLocalActorsRef();
     unsigned int getTaskCount() const;
     bool validPointer(ActorImpl *ai) const;
-    void addTask();
+    void addTask(double cost);
+
+    double getRandomActorCost() const;
+    std::pair<double, std::string> getMaxActorCost() const;
+    double getApproxTaskTimeCost() const;
+
+    upcxx::future<> reduce_communicaiton_matrix(std::vector<std::vector<uint64_t>> &matrix);
+    upcxx::future<> reduce_migration_matrix(std::vector<std::vector<uint64_t>> &matrix);
 
   private:
     bool checkRm(const std::string &actorName);                              // rm actor from map
@@ -227,4 +245,6 @@ class ActorGraph
     void generateAndAddTasks();
 
     unsigned int getTaskCountActive() const;
+    double getApproxTaskTimeCostActive() const;
+    double getActorCostActive() const;
 };

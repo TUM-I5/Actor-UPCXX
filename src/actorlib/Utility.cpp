@@ -54,7 +54,7 @@ upcxx::future<> util::combineFutures(std::vector<upcxx::future<>> &&futs)
     }
     case 1:
     {
-        return futs[0];
+        return std::move(futs[0]);
     }
     case 2:
     {

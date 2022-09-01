@@ -37,11 +37,11 @@ class TerminationWave
 #endif
     size_t msg_id;
     bool sent = false;
+    bool gathering = false;
 
   public:
     std::vector<std::pair<size_t, int>> received;
     TaskDeque *ptd;
-    void setTerminated();
     bool globallyTerminated();
     bool selfTerminated();
 

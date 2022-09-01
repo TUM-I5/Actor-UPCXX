@@ -41,7 +41,7 @@ class SimulationActor final : public SimulationActorBase
     OutPort<std::vector<float>, 64> *dataOut[4]; // outports
 
   public:
-    SimulationActor();
+    SimulationActor() = delete;
     SimulationActor(std::string &&name, size_t xPos, size_t yPos);
     SimulationActor(const std::string &name, size_t xPos, size_t yPos);
 
@@ -74,7 +74,7 @@ class SimulationActor final : public SimulationActorBase
     // SimulationActor(const SimulationActor &sa) ;
     SimulationActor(SimulationActor &&sa);
     SimulationActor &operator=(const SimulationActor &sa) = delete;
-    SimulationActor &operator=(SimulationActor &&sa);
+    SimulationActor &operator=(SimulationActor &&sa) = delete;
     SimulationActor(SimulationActorBaseData &&sabd);
     ~SimulationActor() override final{
         /*

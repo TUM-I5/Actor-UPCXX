@@ -122,7 +122,7 @@ class SimulationActorBase : public ActorImpl
 #endif
 
   public:
-    SimulationActorBase();
+    SimulationActorBase() = delete;
     SimulationActorBase(std::string &&name, std::tuple<size_t, size_t> &&coordinates, bool slow = false);
     SimulationActorBase(const std::string &name, const std::tuple<size_t, size_t> &coordinates, bool slow = false);
 
@@ -144,7 +144,7 @@ class SimulationActorBase : public ActorImpl
     SimulationActorBase(SimulationActorBase &&sa);
     SimulationActorBase(SimulationActorBaseData &&sabd);
     SimulationActorBase &operator=(const SimulationActorBase &sa) = delete;
-    SimulationActorBase &operator=(SimulationActorBase &&sa);
+    SimulationActorBase &operator=(SimulationActorBase &&sa) = delete;
     virtual ~SimulationActorBase();
 
     virtual void initializeBlock() = 0;

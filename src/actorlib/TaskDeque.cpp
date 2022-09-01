@@ -19,18 +19,23 @@ TaskDeque::TaskDeque(ActorGraph *ag)
 {
     constexpr char go[] = "GITTER_OUTPUT";
     constexpr char stealdurterm[] = "STEAL_DURING_TERMINATION";
-    constexpr char cpout[] = "CHECKPOINT_OUTPUT";
+    constexpr char cpout[] = "SAMPLE_OUTPUT";
     constexpr char cd[] = "STEAL_COOLDOWN";
     constexpr char userma[] = "RMA_TASKCOUNT";
-    constexpr char cpbar[] = "CHECKPOINT_BARRIER";
+    constexpr char cpbar[] = "SAMPLE_BARRIER";
     constexpr char timeoutmin[] = "TIMEOUT_IN_MINUTES";
+    constexpr char cpinterval[] = "SAMPLE_INTERVAL";
+    constexpr char stats[] = "PRINT_MORE_STATISTICS";
+    constexpr char fcp[] = "EARLY_SAMPLE";
 
     util::parseBooleanEnvVar(go, print_gitter);
     util::parseBooleanEnvVar(stealdurterm, steal_during_termination);
-    util::parseBooleanEnvVar(cpout, checkpoint_output);
+    util::parseBooleanEnvVar(cpout, sample_output);
     util::parseBooleanEnvVar(cd, steal_cooldown);
     util::parseBooleanEnvVar(userma, rma_taskcount);
-    util::parseBooleanEnvVar(cpbar, checkpoint_barrier);
+    util::parseBooleanEnvVar(cpbar, sample_barrier);
+    util::parseBooleanEnvVar(stats, print_additional_statistics);
+    util::parseBooleanEnvVar(fcp, early_sample);
 
     char *val = getenv(timeoutmin);
 
@@ -44,19 +49,32 @@ TaskDeque::TaskDeque(ActorGraph *ag)
         timeout = 60 * timeout_in_min;
     }
 
+    val = getenv(cpinterval);
+    if (val == nullptr)
+    {
+        cp_interval = 180.0;
+    }
+    else
+    {
+        int cp_in_min = std::stoi(val);
+        cp_interval = cp_in_min;
+    }
+
     if (upcxx::rank_me() == 0)
     {
         std::cerr << "Config: Print gitter output: " << print_gitter << std::endl;
         std::cerr << "Config: Can steal during termination (when graph partially terminated): "
                   << steal_during_termination << std::endl;
-        std::cerr << "Config: Checkpoint output: " << checkpoint_output << std::endl;
+        std::cerr << "Config: Sample output: " << sample_output << std::endl;
         std::cerr << "Config: Cooldown between steal tries and attempts: " << steal_cooldown << std::endl;
-        std::cerr << "Config: Additional barrier after checkpoint output: " << checkpoint_barrier << std::endl;
+        std::cerr << "Config: Additional barrier after sample output: " << sample_barrier << std::endl;
 
         if (timeout >= 0.0)
         {
             std::cerr << "Config: Timeout is set to " << timeout << " second" << std::endl;
         }
+
+        std::cerr << "Config: Statistics output interval: " << cp_interval << std::endl;
     }
 
     constexpr char sd[] = "SLOWDOWN";
@@ -80,6 +98,30 @@ TaskDeque::TaskDeque(ActorGraph *ag)
                   << ") will be slowed down from seconds: "
                   << "[" << slowdown_from << ":" << slowdown_to << "]" << std::endl;
     }
+
+    constexpr char timesync[] = "TIMESTEP_SYNCHRONIZATION";
+    val = getenv(timesync);
+    if (val == nullptr)
+    {
+        timestep_synchronization_at = 0;
+        if (upcxx::rank_me() == 0)
+        {
+            std::cout << "Config: No synchronization points" << std::endl;
+        }
+    }
+    else
+    {
+        timestep_synchronization_at = std::stoi(val);
+        if (upcxx::rank_me() == 0)
+        {
+            std::cout << "Config: Synchronization points after every: " << timestep_synchronization_at << " timesteps."
+                      << std::endl;
+        }
+        do_sync = true;
+    }
+
+    sync_point_difference = timestep_synchronization_at;
+    next_sync_point = timestep_synchronization_at;
 }
 
 bool TaskDeque::abort() { throw std::runtime_error(std::to_string(upcxx::rank_me()) + " is aborting."); }
@@ -175,65 +217,23 @@ bool TaskDeque::canWork() const
 #ifdef USE_ACTOR_TRIGGERS
     return taskCount > 0;
 #else
-    if (rma_taskcount)
+
+    for (auto *a : this->parentActorGraph->localActors)
     {
-        unsigned int _taskCount = (*this->parentActorGraph->taskCount->local());
-        // std::cout << upcxx::rank_me() << ": " << taskCount << std::endl;
-        return _taskCount > 5;
-    }
-    else
-    {
-        for (auto *a : this->parentActorGraph->localActors)
+        if (a->actable())
         {
-            if (a->actable())
-            {
-                return true;
-            }
+            return true;
         }
-        return false;
     }
+    return false;
+
 #endif
 }
 
-bool TaskDeque::checkTermination()
+void TaskDeque::checkTermination()
 {
-    if (termination_result)
-    {
-        return true;
-    }
-
-    if (!computing_temrination_result)
-    {
-        computing_temrination_result = true;
-
-        upcxx::future<unsigned int> active_count =
-            upcxx::reduce_all(this->parentActorGraph->activeActorCount, upcxx::op_fast_add);
-
-        active_count.then(
-            [this](unsigned int cnt)
-            {
-                computing_temrination_result = false;
-
-                if (cnt == 0)
-                {
-                    for (int i = 0; i < upcxx::rank_n(); i++)
-                    {
-                        if (i == upcxx::rank_me())
-                        {
-                            termination_result = true;
-                        }
-                        else
-                        {
-                            upcxx::rpc_ff(
-                                i, [](upcxx::dist_object<TaskDeque *> &rmt) { (*rmt)->termination_result = true; },
-                                remoteTaskque);
-                        }
-                    }
-                }
-            });
-    }
-
-    return false;
+    auto f = this->tw.checkTermination();
+    f.then([this](bool res) { this->termination_result = res; });
 }
 
 #ifdef USE_ACTOR_TRIGGERS
@@ -344,8 +344,7 @@ upcxx::future<std::string> TaskDeque::findVictim()
             return upcxx::make_future(std::move(name));
         }
     }
-
-    if (refresh_victim_list)
+    else
     {
         refresh_victim_list = false;
         upcxx::future<std::vector<std::string>> fut_victims = this->parentActorGraph->migcaller->findActorsToSteal();
@@ -368,13 +367,12 @@ upcxx::future<std::string> TaskDeque::findVictim()
                 return s;
             });
     }
-
-    // Should not even reach here
-    std::string s;
-    return upcxx::make_future(std::move(s));
 #else
     return this->parentActorGraph->migcaller->findAnActorToStealAndMark();
 #endif
+
+    std::string s;
+    return upcxx::make_future(std::move(s));
 }
 
 upcxx::future<bool> TaskDeque::tryToLockVictimAndItsNeighbors(const std::string name)
@@ -392,18 +390,17 @@ upcxx::future<bool> TaskDeque::tryToLockVictimAndItsNeighbors(const std::string 
             upcxx::future<bool> rly_locked = locked.then(
                 [this, name](bool res)
                 {
-                    if (res)
-                    {
-                        return this->parentActorGraph->migcaller->tryStopSelfAndPinNeighborhood(name);
-                    }
-
                     auto it = std::find(victim_list.begin(), victim_list.end(), name);
                     if (it != victim_list.end())
                     {
                         this->victim_list.erase(it);
                     }
 
-                    tried_to_steal_remotely_rejected += 1;
+                    if (res)
+                    {
+                        return this->parentActorGraph->migcaller->tryStopSelfAndPinNeighborhood(name);
+                    }
+
                     return upcxx::make_future(false);
                 });
             return rly_locked;
@@ -414,7 +411,6 @@ upcxx::future<bool> TaskDeque::tryToLockVictimAndItsNeighbors(const std::string 
             return this->parentActorGraph->migcaller->tryStopSelfAndPinNeighborhood(name);
         }
 #endif
-        tried_to_steal_remotely_rejected += 1;
         return upcxx::make_future(false);
     }
     else
@@ -424,7 +420,6 @@ upcxx::future<bool> TaskDeque::tryToLockVictimAndItsNeighbors(const std::string 
             return this->parentActorGraph->migcaller->tryStopSelfAndPinNeighborhood(name);
         }
 
-        tried_to_steal_remotely_rejected += 1;
         return upcxx::make_future(false);
     }
 }
@@ -501,8 +496,8 @@ bool TaskDeque::advance(double timeout)
     }
 
     size_t iter_without_act = 0;
-    constexpr double checkpoint_difference = 120.0;
-    double next_checkpoint = 120.0;
+    double sample_difference = cp_interval;
+    double next_sample = cp_interval;
     int ch_time = 1;
     lastStealTime = util::timepoint();
     lastStealTryTime = util::timepoint();
@@ -527,24 +522,32 @@ bool TaskDeque::advance(double timeout)
 
     while (true)
     {
-
-        if (checkpoint_output)
+        if (do_sync && timestep_synchronization_at != 0)
         {
-            if (util::timerDifference(computationBegin) > next_checkpoint)
+            notify_termination();
+        }
+
+        util::runWithTimer(discharge, timeInDischarge);
+
+        if (sample_output)
+        {
+            if (util::timerDifference(computationBegin) > next_sample || 
+                ((early_sample && util::timerDifference(computationBegin) >= 5.0 && ch_time == 1) ||
+                  (early_sample && util::timerDifference(computationBegin) >= 10.0 && ch_time == 2)
+                ))
             {
+                
 
                 totaltimediff = util::timerDifference(computationBegin);
-
+                auto pr = this->parentActorGraph->getMaxActorCost();
                 std::stringstream sls;
                 sls << "Output number: " << ch_time << ", Rank-" << upcxx::rank_me() << ": (1) " << stole << " | (2) "
-                    << (tried_to_steal_locally_rejected + tried_to_steal_remotely_rejected + stole) << " | (3)"
-                    << util::percentage(tried_to_steal_locally_rejected,
-                                        tried_to_steal_locally_rejected + tried_to_steal_remotely_rejected)
-                    << "/100 | (4) " << this->parentActorGraph->actorCount << ", "
-                    << this->parentActorGraph->localActors.size() << " | (5) " << timeInAct << " | (6) "
-                    << timeInProgress << " | (7) " << timeInBarrier << " | (8) " << timeCheckingTimeout << " | (9) "
-                    << timeCheckingTermination << " | (10) " << timeForcedTermination << " | (11) " << termtrial
-                    << " | (12) " << timeOutside << " | (13) " << totaltimediff << " | (14) "
+                    << tries << " | (3)" << util::percentage(stole, tries) << "/100 | (4) "
+                    << this->parentActorGraph->actorCount << ", " << this->parentActorGraph->localActors.size()
+                    << " | (5) " << timeInAct << " | (6) " << timeInProgress << " | (7) " << timeInBarrier << " | (8) "
+                    << timeCheckingTimeout << " | (9) " << timeCheckingTermination << " | (10) "
+                    << timeForcedTermination << " | (11) " << termtrial << " | (12) " << timeOutside << " | (13) "
+                    << totaltimediff << " | (14) "
                     << util::percentage((timeInAct + timeInProgress + timeInBarrier + timeCheckingTimeout +
                                          timeCheckingTermination + timeOutside),
                                         totaltimediff)
@@ -557,14 +560,38 @@ bool TaskDeque::advance(double timeout)
                     << "X"
 #endif
                     << " | (19) (" << execs << ", " << exec_during_interval << ") | (20) " << this->canWork()
-                    << " | (21) " << this->during_migration << " | (22) " << this->termination_result << std::endl;
+                    << " | (21) " << this->during_migration << " | (22) " << this->termination_result << " | (23) ("
+                    << this->parentActorGraph->getTaskCountActive() << ", "
+                    << *this->parentActorGraph->taskCount->local() << ") | (24) ("
+                    << this->parentActorGraph->getActorCostActive() << ", "
+                    << *this->parentActorGraph->gatheredCost->local() << ") | (25) (" << pr.first << ", " << pr.second
+                    << ")"
+                    << " | (26) " << iter_without_act << " | (27) ("
+                    << this->parentActorGraph->getApproxTaskTimeCostActive() << ", "
+                    << *this->parentActorGraph->approxTaskCost->local() << ")" << std::endl;
 
-                next_checkpoint += checkpoint_difference;
+                *this->parentActorGraph->taskCount->local() = this->parentActorGraph->getTaskCountActive();
+                *this->parentActorGraph->approxTaskCost->local() =
+                    this->parentActorGraph->getApproxTaskTimeCostActive();
+                *this->parentActorGraph->gatheredCost->local() = this->parentActorGraph->getActorCostActive();
+
+                if (!early_sample)
+                {
+                    next_sample += sample_difference;
+                   
+                } else {
+                    if (ch_time > 2)
+                    {
+                        next_sample += sample_difference;
+                    }
+                }
+
                 ch_time += 1;
+                
                 std::cout << sls.str();
                 exec_during_interval = 0;
 
-                if (checkpoint_barrier)
+                if (sample_barrier)
                 {
                     upcxx::barrier();
                     if (upcxx::rank_me() == 0)
@@ -645,12 +672,21 @@ bool TaskDeque::advance(double timeout)
             auto &pr = *atIterator;
             const std::string &name = pr.first;
 #else
-        std::set<ActorImpl *> la = this->parentActorGraph->getLocalActorsRef();
-        for (auto *a : la)
+        std::set<ActorImpl *> la(this->parentActorGraph->getUnorderedLocalActorsRef().begin(),
+                                 this->parentActorGraph->getUnorderedLocalActorsRef().end());
+        for (ActorImpl *a : la)
         {
+            if (sample_output)
+            {
+                if (util::timerDifference(computationBegin) > next_sample)
+                {
+                    break;
+                }
+            }
+
             iter_without_act += 1;
 
-            util::runWithTimer(discharge, timeInDischarge);
+            // util::runWithTimer(discharge, timeInDischarge);
             util::runWithTimer(progress, timeInProgress);
             // upcxx::discharge();
             // upcxx::progress();
@@ -664,13 +700,12 @@ bool TaskDeque::advance(double timeout)
             const std::string &name = a->getNameRef();
 #endif
 
-            GlobalActorRef aref = this->parentActorGraph->getActorNoThrow(name);
-            // std::cout << upcxx::rank_me() << " is iterating: " << name << " " << aref << std::endl;
+            // GlobalActorRef aref = this->parentActorGraph->getActorNoThrow(name);
+            //  std::cout << upcxx::rank_me() << " is iterating: " << name << " " << aref << std::endl;
 
-            if (aref != nullptr)
+            // if (aref != nullptr)
             {
-
-                ActorImpl *ai = *aref.local();
+                ActorImpl *ai = a;
 
                 if constexpr (config::migrationtype == config::MigrationType::ASYNC ||
                               config::migrationtype == config::MigrationType::OFFLOAD)
@@ -682,7 +717,7 @@ bool TaskDeque::advance(double timeout)
                     }
                 }
 
-                if (ai->actable())
+                if (ai->actable() && (!do_sync || (do_sync && ai->getPastExecutionCount() < next_sync_point)))
                 // if (ai->getRunningState() == ActorState::Running)
                 {
 #ifdef USE_ACTOR_TRIGGERS
@@ -701,9 +736,9 @@ bool TaskDeque::advance(double timeout)
                         util::runWithTimer(intern_b_act, timeInAct);
                         // ai->b_act();
                         util::runWithTimer(progress, timeInProgress);
-                        util::runWithTimer(discharge, timeInDischarge);
-                        // upcxx::discharge();
-                        // upcxx::progress();
+                        // util::runWithTimer(discharge, timeInDischarge);
+                        //  upcxx::discharge();
+                        //  upcxx::progress();
                     }
 #else
 
@@ -730,8 +765,11 @@ bool TaskDeque::advance(double timeout)
                                 //           << std::chrono::milliseconds(static_cast<uint64_t>(aafter *
                                 //           2000.0)).count()
                                 //           << "ms";
-                                std::this_thread::sleep_for(
-                                    std::chrono::milliseconds(static_cast<uint64_t>(aafter * 2000.0)));
+                                uint64_t additional_time = static_cast<uint64_t>(aafter * 2000.0);
+
+                                std::this_thread::sleep_for(std::chrono::milliseconds(additional_time));
+
+                                ai->addCost(static_cast<float>(additional_time));
                             }
                         }
                     }
@@ -741,9 +779,19 @@ bool TaskDeque::advance(double timeout)
                     }
 
                     util::runWithTimer(progress, timeInProgress);
-                    util::runWithTimer(discharge, timeInDischarge);
-                    // upcxx::discharge();
-                    // upcxx::progress();
+                    // util::runWithTimer(discharge, timeInDischarge);
+                    //  upcxx::discharge();
+                    //  upcxx::progress();
+
+                    if (do_sync && this->timestep_synchronization_at != 0)
+                    {
+                        notify_termination();
+
+                        if (ai->getPastExecutionCount() == next_sync_point)
+                        {
+                            enter_sync_point();
+                        }
+                    }
 
 #endif
                 }
@@ -758,17 +806,22 @@ bool TaskDeque::advance(double timeout)
                 {
                     try_offload();
                 }
+
+                util::runWithTimer(progress, timeInProgress);
             }
 
             util::runWithTimer(progress, timeInProgress);
             // upcxx::progress();
 
-            if (checkTimeout(l, timeout))
+            if constexpr (config::migrationtype == config::MigrationType::BULK || config::interrupt)
             {
-                goto ret_false;
+                if (checkTimeout(l, timeout))
+                {
+                    goto ret_false;
+                }
             }
 
-            util::runWithTimer(discharge, timeInDischarge);
+            // util::runWithTimer(discharge, timeInDischarge);
             util::runWithTimer(progress, timeInProgress);
             // upcxx::discharge();
             // upcxx::progress();
@@ -798,17 +851,25 @@ bool TaskDeque::advance(double timeout)
         c = 0;
 #endif
 
-        util::runWithTimer(discharge, timeInDischarge);
+        if (do_sync && actors_in_sync_point == this->parentActorGraph->getActiveActors())
+        {
+            wait_for_sync_point();
+        }
+
+        // util::runWithTimer(discharge, timeInDischarge);
         util::runWithTimer(progress, timeInProgress);
         // upcxx::discharge();
         // upcxx::progress();
 
-        if (checkTimeout(l, timeout))
+        if constexpr (config::migrationtype == config::MigrationType::BULK || config::interrupt)
         {
-            goto ret_false;
+            if (checkTimeout(l, timeout))
+            {
+                goto ret_false;
+            }
         }
 
-        util::runWithTimer(discharge, timeInDischarge);
+        // util::runWithTimer(discharge, timeInDischarge);
         util::runWithTimer(progress, timeInProgress);
         // upcxx::discharge();
         // upcxx::progress();
@@ -823,13 +884,15 @@ bool TaskDeque::advance(double timeout)
             try_offload();
         }
 
-        util::runWithTimer(discharge, timeInDischarge);
+        // util::runWithTimer(discharge, timeInDischarge);
         util::runWithTimer(progress, timeInProgress);
         // upcxx::discharge();
         // upcxx::progress();
 
         // try to terminate
-        if (this->checkTermination())
+
+        this->checkTermination();
+        if (termination_result)
         {
             goto ret_true;
         }
@@ -837,7 +900,7 @@ bool TaskDeque::advance(double timeout)
         this->check_abort(computationBegin);
 
         // this->checkForcedTermination();
-        util::runWithTimer(discharge, timeInDischarge);
+        // util::runWithTimer(discharge, timeInDischarge);
         util::runWithTimer(progress, timeInProgress);
         // upcxx::discharge();
         // upcxx::progress();
@@ -852,36 +915,84 @@ ret_true:
               "(6) PROGRESS | (7) BARRIER | "
               " (8) TIMEOUT_CHECK | (9) TERMINATION_CHECK_DUR | (10) FORCE_TERMINATION_DUR | (11) "
               "TERMINATION_CHECK_COUNT | (12) OUTSIDE | "
-              " (13) TOTAL | (14) PERCENTAGE | (15) FORCED"
+              " (13) TOTAL | (14) PERCENTAGE | (15) FORCED | (24) "
            << std::endl;
     }
 
     totaltimediff = util::timerDifference(computationBegin);
 
-    ss << "Rank-" << upcxx::rank_me() << ": (1) " << stole << " | (2) "
-       << (tried_to_steal_locally_rejected + tried_to_steal_remotely_rejected + stole) << " | (3)"
-       << util::percentage(tried_to_steal_locally_rejected,
-                           tried_to_steal_locally_rejected + tried_to_steal_remotely_rejected)
-       << "/100 | (4) " << this->parentActorGraph->actorCount << " | (5) " << timeInAct << " | (6) " << timeInProgress
-       << " | (7) " << timeInBarrier << " | (8) " << timeCheckingTimeout << " | (9) " << timeCheckingTermination
-       << " | (10) " << timeForcedTermination << " | (11) " << termtrial << " | (12) " << timeOutside << " | (13) "
-       << totaltimediff << " | (14) "
+    ss << "Rank-" << upcxx::rank_me() << ": (1) " << stole << " | (2) " << tries << " | (3)"
+       << util::percentage(stole, tries) << "/100 | (4) " << this->parentActorGraph->actorCount << " | (5) "
+       << timeInAct << " | (6) " << timeInProgress << " | (7) " << timeInBarrier << " | (8) " << timeCheckingTimeout
+       << " | (9) " << timeCheckingTermination << " | (10) " << timeForcedTermination << " | (11) " << termtrial
+       << " | (12) " << timeOutside << " | (13) " << totaltimediff << " | (14) "
        << util::percentage((timeInAct + timeInProgress + timeInBarrier + timeCheckingTimeout + timeCheckingTermination +
                             timeOutside),
                            totaltimediff)
        << "/100"
-       << "| (15)" << forcedTermination << " | (16) " << termination_result << std::endl;
+       << " | (15)" << forcedTermination << " | (16) " << termination_result << " | (24) "
+       << *this->parentActorGraph->gatheredCost->local() << std::endl;
 
     std::cout << ss.str();
     goingOutside = util::timepoint();
 
+    upcxx::discharge();
+    upcxx::progress();
+
     totaltimediff = upcxx::reduce_all(totaltimediff, upcxx::experimental::op_max).wait();
-    upcxx::barrier();
+    // upcxx::barrier();
     if (upcxx::rank_me() == 0)
     {
         runt = "time-to-solution:" + std::to_string(totaltimediff);
         std::cout << runt << std::endl;
     }
+    upcxx::barrier();
+
+    if (print_additional_statistics)
+    {
+        if (upcxx::rank_me() == 0)
+        {
+            std::vector<std::vector<uint64_t>> comm_matrix(upcxx::rank_n(), std::vector<uint64_t>());
+            std::vector<std::vector<uint64_t>> migration_matrix(upcxx::rank_n(), std::vector<uint64_t>());
+
+            upcxx::future<> commreduced = this->parentActorGraph->reduce_communicaiton_matrix(comm_matrix);
+            upcxx::future<> migreduced = this->parentActorGraph->reduce_migration_matrix(migration_matrix);
+            upcxx::future<> reduced = upcxx::when_all(std::move(commreduced), std::move(migreduced));
+
+            reduced.wait();
+
+            std::stringstream ss;
+            ss << "COMM_MATRIX BEGIN\n";
+            for (int i = 0; i < upcxx::rank_n(); i++)
+            {
+                for (int j = 0; j < upcxx::rank_n() - 1; j++)
+                {
+                    ss << comm_matrix[i][j];
+                    ss << ",";
+                }
+                ss << comm_matrix[i][upcxx::rank_n() - 1];
+                ss << "\n";
+            }
+            ss << "COMM_MATRIX END\n";
+
+            ss << "MIGRATION_MATRIX BEGIN\n";
+            for (int i = 0; i < upcxx::rank_n(); i++)
+            {
+                for (int j = 0; j < upcxx::rank_n() - 1; j++)
+                {
+                    ss << migration_matrix[i][j];
+                    ss << ",";
+                }
+                ss << migration_matrix[i][upcxx::rank_n() - 1];
+                ss << "\n";
+            }
+            ss << "MIGRATION_MATRIX END";
+            ss << std::endl;
+            std::cout << ss.str();
+        }
+        upcxx::barrier();
+    }
+
     return true;
 
 ret_false:
@@ -927,12 +1038,17 @@ void TaskDeque::try_steal()
     if constexpr (config::migrationtype == config::MigrationType::ASYNC)
     {
         if (steal_cooldown &&
-            (util::timerDifference(lastStealTime) <= 0.2 || util::timerDifference(lastStealTryTime) <= 0.1))
+            (util::timerDifference(lastStealTime) <= 0.1 || util::timerDifference(lastStealTryTime) <= 0.1))
         {
             return;
         }
 
-        if (util::timerDifference(computationBegin) <= 2.5)
+        if (util::timerDifference(computationBegin) <= 5.0)
+        {
+            return;
+        }
+
+        if (sync_started)
         {
             return;
         }
@@ -988,7 +1104,6 @@ void TaskDeque::try_steal()
                         }
                         else
                         {
-                            // tried_to_steal_locally_rejected += 1;
                             consecutiveStealTries += 1;
                         }
                     });
@@ -1072,6 +1187,16 @@ void TaskDeque::try_offload()
             return;
         }
 
+        if (util::timerDifference(computationBegin) <= 5.0)
+        {
+            return;
+        }
+
+        if (sync_started)
+        {
+            return;
+        }
+
         lastWorkloadExchange = util::timepoint();
 
         if (!during_migration && !during_victim_search && !forcedTermination && _stole.ready())
@@ -1092,7 +1217,6 @@ void TaskDeque::try_offload()
                 opt_str_fut.then(
                     [this](std::string opt_str, upcxx::intrank_t to)
                     {
-                        tries += 1;
                         if (!during_victim_search)
                         {
                             throw std::runtime_error("Second steal attempt started before the first ended");
@@ -1104,6 +1228,7 @@ void TaskDeque::try_offload()
 #ifdef REPORT_MAIN_ACTIONS
                             std::cout << upcxx::rank_me() << " tries to offload: " << opt_str << std::endl;
 #endif
+                            tries += 1;
                             {
                                 std::string victim = std::move(opt_str);
 
@@ -1115,15 +1240,10 @@ void TaskDeque::try_offload()
 
                                 upcxx::future<bool> stopped = tryToLockVictimAndItsNeighbors(victim);
 
-                                upcxx::future<bool> stole = tryToOffload(stopped, victim, to);
+                                upcxx::future<bool> l_stole = tryToOffload(stopped, victim, to);
 
-                                _stole = std::move(stole);
+                                _stole = std::move(l_stole);
                             }
-                        }
-                        else
-                        {
-                            tried_to_steal_locally_rejected += 1;
-                            consecutiveStealTries += 1;
                         }
                     });
             }
@@ -1177,4 +1297,62 @@ unsigned int TaskDeque::getTaskCount() const
     }
 
 #endif
+}
+
+void TaskDeque::enter_sync_point()
+{
+    if (!this->parentActorGraph->has_a_terminated_actor)
+    {
+        if (actors_in_sync_point == 0)
+        {
+            this->parentActorGraph->reject_migration = true;
+            sync_started = true;
+            for (int i = 0; i < upcxx::rank_n(); i++)
+            {
+                if (upcxx::rank_me() != i)
+                {
+                    upcxx::rpc_ff(
+                        i, [](upcxx::dist_object<TaskDeque *> &rmt) { (*rmt)->sync_started = true; }, remoteTaskque);
+                }
+            }
+            if (upcxx::rank_me() == 0)
+            {
+                // std::cout << "Sync no." << sync_number << " commences" << std::endl;
+            }
+            upcxx::discharge();
+        }
+    }
+
+    actors_in_sync_point += 1;
+}
+
+void TaskDeque::wait_for_sync_point()
+{
+    upcxx::barrier();
+    actors_in_sync_point = 0;
+    this->parentActorGraph->reject_migration = false;
+    sync_started = false;
+    if (upcxx::rank_me() == 0)
+    {
+        // std::cout << "Sync no." << sync_number << " has ended" << std::endl;
+    }
+    sync_number += 1;
+    next_sync_point += sync_point_difference;
+}
+
+void TaskDeque::notify_termination()
+{
+    if (this->parentActorGraph->has_a_terminated_actor)
+    {
+        for (int i = 0; i < upcxx::rank_n(); i++)
+        {
+            if (upcxx::rank_me() != i)
+            {
+                upcxx::rpc_ff(
+                    i, [](upcxx::dist_object<TaskDeque *> &rmt) { (*rmt)->termination_started = true; }, remoteTaskque);
+            }
+        }
+        termination_started = true;
+        upcxx::discharge();
+    }
 }

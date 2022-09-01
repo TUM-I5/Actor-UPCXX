@@ -38,7 +38,7 @@
  * enum type: available types of boundary conditions
  */
 // TODO: check if enum class typedef enum cuase different behaviour!
-enum class BoundaryType
+enum class BoundaryType : int
 {
     OUTFLOW,
     WALL,
@@ -50,7 +50,7 @@ enum class BoundaryType
 /**
  * enum type: numbering of the boundary edges
  */
-enum class BoundaryEdge
+enum class BoundaryEdge : int
 {
     BND_LEFT,
     BND_RIGHT,

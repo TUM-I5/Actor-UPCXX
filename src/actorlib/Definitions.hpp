@@ -2,4 +2,4 @@
 
 #include <cstddef>
 
-constexpr size_t history_array_length = 32;
+constexpr size_t history_array_length = 2;

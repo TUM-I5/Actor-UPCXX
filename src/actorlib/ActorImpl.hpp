@@ -77,6 +77,7 @@ class ActorImpl
 
   public:
     ActorGraph *parentActorGraph; // Ag that this actor is connected
+    static double assumed_cost;
 
   protected:
     std::unordered_map<std::string, AbstractInPort *> inPorts;   // map of all inports
@@ -96,22 +97,20 @@ class ActorImpl
     template <typename T, int capacity> std::vector<std::pair<std::string, std::vector<T>>> extract_messages();
 
   private:
-    std::chrono::steady_clock::time_point tbegin;
-    std::chrono::steady_clock::time_point tend;
     upcxx::intrank_t markedBy = -1;
     size_t pinnedBy = 0;
     std::vector<unsigned short> pin_count;
-    std::array<unsigned int, history_array_length> actor_cost{};
+    std::array<double, history_array_length> actor_cost{0.0};
     size_t index_for_actor_cost = 0;
     mutable bool prepared = false;
     // bool force_unmarked = false;
     // bool force_unpinned = false;
-    bool acted = false;
     size_t calls = 0;
     bool initial_act = true;
     bool terminated = false;
 
   public:
+    uint64_t acted = 0;
     ActorImpl(const std::string &name);
     ActorImpl(std::string &&name);
     ActorImpl();
@@ -121,8 +120,8 @@ class ActorImpl
     ActorImpl(ActorData &&data);
     ActorImpl(ActorData &&data, std::tuple<std::vector<std::unique_ptr<InPortInformationBase>>,
                                            std::vector<std::unique_ptr<OutPortInformationBase>>> &&portsInformation);
-    ActorImpl &operator=(const ActorImpl &act);
-    ActorImpl &operator=(ActorImpl &&act);
+    ActorImpl &operator=(const ActorImpl &act) = delete;
+    ActorImpl &operator=(ActorImpl &&act) = delete;
     ActorImpl &operator=(ActorImpl &act) = delete;
     std::string toString();
     AbstractOutPort *getOutPort(std::string &name);
@@ -238,11 +237,13 @@ class ActorImpl
     std::vector<std::pair<std::string, size_t>> getMessageCounts() const;
     bool checkMessageCountsSameAsSaved() const;
     bool is_prepared();
-    float getCost() const;
+    double getCost() const;
+    void addCost(double additional_cost);
     bool hasNoMessages() const;
     bool stopFromAct();
     size_t canActNTimes() const;
     void addTask(const std::string &increased_port_name);
+    uint64_t getPastExecutionCount() const;
 
   protected:
     bool stop();
@@ -288,11 +289,13 @@ class ActorImpl
             writer.write(object.workTokens);
             writer.write(object.workTime);
             writer.write(object.markedBy);
-            writer.write(object.state.load());
+            ActorState as = object.state.load();
+            writer.write(as);
             writer.write(object.actor_cost);
             writer.write(object.index_for_actor_cost);
             writer.write(object.initial_act);
             writer.write(object.terminated);
+            writer.write(object.acted);
 #ifdef REPORT_MAIN_ACTIONS
             // std::cout << "Serializing ActorImpl: " << object.getName() << " the state is: " <<
             // ActorImpl::asp.as2str(object.getRunningState()) << std::endl;
@@ -307,14 +310,15 @@ class ActorImpl
             uint64_t workTime = reader.template read<uint64_t>();
             auto rc = reader.template read<upcxx::intrank_t>();
             ActorState as = reader.template read<ActorState>();
-            std::array<unsigned int, history_array_length> acost =
-                reader.template read<std::array<unsigned int, history_array_length>>();
+            std::array<double, history_array_length> acost =
+                reader.template read<std::array<double, history_array_length>>();
             size_t index = reader.template read<size_t>();
             bool initial_act = reader.template read<bool>();
             bool term = reader.template read<bool>();
+            uint64_t acted = reader.template read<uint64_t>();
 
             ActorData *v = ::new (storage) ActorData(std::move(name), workTokens, workTime, std::move(rc), as,
-                                                     std::move(acost), index, initial_act, term);
+                                                     std::move(acost), index, initial_act, term, acted);
 #ifdef REPORT_MAIN_ACTIONS
             // std::cout << "Deserializing ActorImpl: " << v->name << " the state is: " <<
             // ActorImpl::asp.as2str(v->state) << std::endl;

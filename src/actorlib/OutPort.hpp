@@ -227,22 +227,6 @@ template <typename type, int capacity> void OutPort<type, capacity>::writeIntern
     }
 }
 
-template <typename type, int capacity> void OutPort<type, capacity>::writeInternalSeq(type &&element) const
-{
-    if (remoteChannel.where() == upcxx::rank_me())
-    {
-        remoteChannel.local()->enqueue(std::move(element));
-    }
-    else
-    {
-        upcxx::rpc_ff(
-            remoteChannel.where(),
-            [](upcxx::global_ptr<Channel<type, capacity>> remoteChannel, type data)
-            { remoteChannel.local()->enqueue(std::move(data)); },
-            remoteChannel, std::move(element));
-    }
-}
-
 template <typename type, int capacity> std::string OutPort<type, capacity>::toString()
 {
     std::stringstream ss;
@@ -353,6 +337,11 @@ void OutPort<type, capacity>::applyPortInfo(std::unique_ptr<OutPortInformation<t
     {
         throw std::runtime_error("apply port info name mismatch");
     }
+
+    if (!this->buffer.empty() || this->unusedCapacity != capacity)
+    {
+        throw std::runtime_error("Apply port info wasnt applied to a crisp outport!");
+    }
     unusedCapacity = opo->unusedCap;
     this->buffer = std::move(opo->buffer);
 }
@@ -360,6 +349,11 @@ void OutPort<type, capacity>::applyPortInfo(std::unique_ptr<OutPortInformation<t
 template <typename type, int capacity>
 void OutPort<type, capacity>::applyPortInfo(int cap, std::vector<std::vector<float>> &&buf)
 {
+    if (!this->buffer.empty() || this->unusedCapacity != capacity)
+    {
+        throw std::runtime_error("Apply port info wasnt applied to a crisp outport! 2");
+    }
+
     unusedCapacity = cap;
     this->buffer = std::move(buf);
 }
@@ -468,4 +462,24 @@ template <typename type, int capacity> OutPort<type, capacity>::~OutPort<type, c
 template <typename type, int capacity> bool OutPort<type, capacity>::connected() const
 {
     return this->remoteChannel != nullptr;
+}
+
+#include "ActorGraph.hpp"
+
+template <typename type, int capacity> void OutPort<type, capacity>::writeInternalSeq(type &&element) const
+{
+    if (remoteChannel.where() == upcxx::rank_me())
+    {
+        remoteChannel.local()->enqueue(std::move(element));
+    }
+    else
+    {
+        upcxx::rpc_ff(
+            remoteChannel.where(),
+            [](upcxx::global_ptr<Channel<type, capacity>> remoteChannel, type data)
+            { remoteChannel.local()->enqueue(std::move(data)); },
+            remoteChannel, std::move(element));
+    }
+
+    this->connectedActor->parentActorGraph->register_message(remoteChannel.where());
 }

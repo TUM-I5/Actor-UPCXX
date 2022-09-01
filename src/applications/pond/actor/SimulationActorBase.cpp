@@ -31,19 +31,6 @@ SimulationActorBase::SimulationActorBase(std::string &&name, std::tuple<size_t, 
 {
 }
 
-SimulationActorBase::SimulationActorBase()
-    : ActorImpl(), slow(false), position{0, 0}, block(nullptr), currentState(SimulationActorState::INITIAL),
-      currentTime(0.0f), timestepBaseline(0.0f), outputDelta(0.0f), nextWriteTime(0.0f), endTime(0.0f), patchUpdates(0),
-      patchArea(),
-#if defined(WRITENETCDF)
-      writer(nullptr),
-#elif defined(WRITEVTK)
-      writer(nullptr),
-#endif
-      active(false) //, activeNeighbors()
-{
-}
-
 SimulationActorBase::SimulationActorBase(const std::string &name, const std::tuple<size_t, size_t> &coordinates,
                                          bool slow)
     : ActorImpl(name), slow(slow), position{std::get<0>(coordinates), std::get<1>(coordinates)},
@@ -153,45 +140,6 @@ SimulationActorBase::SimulationActorBase(SimulationActorBase &&sa)
     }
 }
 
-SimulationActorBase &SimulationActorBase::operator=(SimulationActorBase &&sa)
-{
-    ActorImpl::operator=(dynamic_cast<ActorImpl &&>(std::move(sa)));
-
-    slow = sa.slow;
-    position[0] = sa.position[0];
-    position[1] = sa.position[1];
-    block = std::move(sa.block);
-    currentState = sa.currentState;
-    currentTime = sa.currentTime;
-
-    timestepBaseline = sa.timestepBaseline;
-    outputDelta = sa.outputDelta;
-    nextWriteTime = sa.nextWriteTime;
-    endTime = sa.endTime;
-    patchUpdates = sa.patchUpdates;
-    patchArea = std::move(sa.patchArea);
-#if defined(WRITENETCDF) || defined(WRITEVTK)
-    writer = std::move(sa.writer);
-#endif
-    active = (sa.active);
-#ifdef TIME
-    timeSpentRunning = sa.timeSpentRunning;
-    timeSpentFinishing = sa.timeSpentFinishing;
-    timeSpentTerminated = sa.timeSpentTerminated;
-    timeSpentReading = sa.timeSpentReading;
-    timeSpentWriting = sa.timeSpentWriting;
-    timeSpentReceiving = sa.timeSpentReceiving;
-    timeSpentNotReceiving = sa.timeSpentNotReceiving;
-    timeSpentComputing = sa.timeSpentComputing;
-    timesWrittenToFile = sa.timesWrittenToFile;
-#endif
-    if (SimulationActorBase::configuration->scenario->endSimulation() != endTime)
-    {
-        throw std::runtime_error("Endtime should not change during moves or migration");
-    }
-    return *this;
-}
-
 float SimulationActorBase::getMaxBlockTimestepSize()
 {
     block->computeMaxTimestep();
@@ -215,10 +163,11 @@ void SimulationActorBase::act()
         return;
     }
 
-    if (currentState == SimulationActorState::TERMINATED)
-    {
-        return;
-    }
+    // If we are triggered but can still act lets act as if normal?
+    // if (currentState == SimulationActorState::TERMINATED)
+    // {
+    //     return;
+    // }
 
     auto start = std::chrono::high_resolution_clock::now();
 
